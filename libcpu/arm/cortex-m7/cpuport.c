@@ -22,10 +22,7 @@
 #include <mprotect.h>
 #endif
 
-#if               /* ARMCC */ (  (defined ( __CC_ARM ) && defined ( __TARGET_FPU_VFP ))    \
-                  /* Clang */ || (defined ( __clang__ ) && defined ( __VFP_FP__ ) && !defined(__SOFTFP__)) \
-                  /* IAR */   || (defined ( __ICCARM__ ) && defined ( __ARMVFP__ ))        \
-                  /* GNU */   || (defined ( __GNUC__ ) && defined ( __VFP_FP__ ) && !defined(__SOFTFP__)) )
+#if defined (__VFP_FP__) && !defined(__SOFTFP__)
 #define USE_FPU   1
 #else
 #define USE_FPU   0
@@ -35,6 +32,24 @@
 rt_uint32_t rt_interrupt_from_thread;
 rt_uint32_t rt_interrupt_to_thread;
 rt_uint32_t rt_thread_switch_interrupt_flag;
+
+/* GDB-only debug snapshots for first context-switch bring-up. */
+volatile rt_uint32_t rtt_dbg_switch_to_sp_addr;
+volatile rt_uint32_t rtt_dbg_switch_to_sp_value;
+volatile rt_uint32_t rtt_dbg_pendsv_enter_lr;
+volatile rt_uint32_t rtt_dbg_pendsv_enter_psp;
+volatile rt_uint32_t rtt_dbg_pendsv_exit_lr;
+volatile rt_uint32_t rtt_dbg_pendsv_exit_psp;
+volatile rt_uint32_t rtt_dbg_pendsv_exit_stack_lr;
+volatile rt_uint32_t rtt_dbg_pendsv_exit_stack_pc;
+volatile rt_uint32_t rtt_dbg_pendsv_exit_stack_xpsr;
+volatile rt_uint32_t rtt_dbg_hardfault_lr;
+volatile rt_uint32_t rtt_dbg_hardfault_msp;
+volatile rt_uint32_t rtt_dbg_hardfault_psp;
+volatile rt_uint32_t rtt_dbg_hardfault_stack_lr;
+volatile rt_uint32_t rtt_dbg_hardfault_stack_pc;
+volatile rt_uint32_t rtt_dbg_hardfault_stack_xpsr;
+volatile rt_uint32_t rtt_dbg_hardfault_frame_ext;
 /* exception hook */
 static rt_err_t (*rt_exception_hook)(void *context) = RT_NULL;
 

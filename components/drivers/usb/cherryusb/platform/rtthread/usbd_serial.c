@@ -19,6 +19,10 @@
 #define CONFIG_USBDEV_SERIAL_RX_BUFSIZE (2048)
 #endif
 
+#ifndef CONFIG_USBDEV_SERIAL_TX_BUFSIZE
+#define CONFIG_USBDEV_SERIAL_TX_BUFSIZE (2048)
+#endif
+
 struct usbd_serial {
     struct rt_device parent;
     uint8_t busid;
@@ -28,16 +32,72 @@ struct usbd_serial {
     struct usbd_interface intf_data;
     usb_osal_sem_t tx_done;
     uint8_t minor;
+    volatile uint8_t tx_active;
     char name[32];
     struct rt_ringbuffer rx_rb;
     rt_uint8_t rx_rb_buffer[CONFIG_USBDEV_SERIAL_RX_BUFSIZE];
+    struct rt_ringbuffer tx_rb;
+    rt_uint8_t tx_rb_buffer[CONFIG_USBDEV_SERIAL_TX_BUFSIZE];
+    USB_MEM_ALIGNX uint8_t tx_pkt[USB_ALIGN_UP(64, CONFIG_USB_ALIGN_SIZE)];
 };
 
 static uint32_t g_devinuse = 0;
 
+volatile uint32_t dbg_serial_write_calls = 0;
+volatile int32_t  dbg_serial_write_ret   = 0;
+volatile int32_t  dbg_serial_sem_ret     = 0;
+volatile uint32_t dbg_serial_write_ok    = 0;
+volatile uint32_t dbg_serial_write_timeout = 0;
+volatile uint32_t dbg_serial_write_notcfg = 0;
+volatile uint32_t dbg_serial_bulkin_cnt  = 0;
+volatile uint32_t dbg_serial_tx_kick     = 0;
+volatile uint32_t dbg_serial_tx_kick_fail = 0;
+
 static USB_NOCACHE_RAM_SECTION USB_MEM_ALIGNX uint8_t g_usbd_serial_cdc_acm_rx_buf[CONFIG_USBDEV_MAX_CDC_ACM_CLASS][USB_ALIGN_UP(512, CONFIG_USB_ALIGN_SIZE)];
 
 static struct usbd_serial g_usbd_serial_cdc_acm[CONFIG_USBDEV_MAX_CDC_ACM_CLASS];
+
+static void usbd_serial_kick_tx(struct usbd_serial *serial);
+
+volatile uint32_t dbg_serial_rx_rearm = 0;
+volatile uint32_t dbg_serial_rx_rearm_skip = 0;
+volatile uint32_t dbg_serial_bulkout_cnt = 0;
+
+void usbd_serial_reset_tx(void)
+{
+    for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
+        struct usbd_serial *serial = &g_usbd_serial_cdc_acm[devno];
+        serial->tx_active = 0;
+        rt_ringbuffer_reset(&serial->tx_rb);
+        if (serial->out_ep) {
+            dbg_serial_rx_rearm++;
+            usbd_ep_start_read(serial->busid, serial->out_ep,
+                g_usbd_serial_cdc_acm_rx_buf[serial->minor],
+                usbd_get_ep_mps(serial->busid, serial->out_ep));
+        } else {
+            dbg_serial_rx_rearm_skip++;
+        }
+    }
+}
+
+void usbd_serial_rearm_rx(void)
+{
+    for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
+        struct usbd_serial *serial = &g_usbd_serial_cdc_acm[devno];
+        if (serial->out_ep) {
+            uint16_t mps = usbd_get_ep_mps(serial->busid, serial->out_ep);
+            if (mps > 0) {
+                dbg_serial_rx_rearm++;
+                usbd_ep_start_read(serial->busid, serial->out_ep,
+                    g_usbd_serial_cdc_acm_rx_buf[serial->minor], mps);
+            } else {
+                dbg_serial_rx_rearm_skip++;
+            }
+        } else {
+            dbg_serial_rx_rearm_skip++;
+        }
+    }
+}
 
 static struct usbd_serial *usbd_serial_alloc(void)
 {
@@ -76,13 +136,17 @@ static rt_err_t usbd_serial_open(struct rt_device *dev, rt_uint16_t oflag)
 
     serial = (struct usbd_serial *)dev;
 
-    while(!usb_device_is_configured(serial->busid)) {
+    for (int i = 0; i < 300; i++) {
+        if (usb_device_is_configured(serial->busid))
+            break;
         rt_thread_mdelay(10);
     }
 
-    usbd_ep_start_read(serial->busid, serial->out_ep,
-                       g_usbd_serial_cdc_acm_rx_buf[serial->minor],
-                       usbd_get_ep_mps(serial->busid, serial->out_ep));
+    if (usb_device_is_configured(serial->busid) && serial->out_ep) {
+        usbd_ep_start_read(serial->busid, serial->out_ep,
+                           g_usbd_serial_cdc_acm_rx_buf[serial->minor],
+                           usbd_get_ep_mps(serial->busid, serial->out_ep));
+    }
     return RT_EOK;
 }
 
@@ -110,43 +174,65 @@ static rt_ssize_t usbd_serial_write(struct rt_device *dev,
                                     rt_size_t size)
 {
     struct usbd_serial *serial;
-    int ret = 0;
-    rt_uint8_t *align_buf;
 
     RT_ASSERT(dev != RT_NULL);
 
     serial = (struct usbd_serial *)dev;
 
+    dbg_serial_write_calls++;
+
     if (!usb_device_is_configured(serial->busid)) {
+        dbg_serial_write_notcfg++;
+        serial->tx_active = 0;
         return -RT_EPERM;
     }
-    align_buf = (rt_uint8_t *)buffer;
 
-    if ((uint32_t)buffer & (CONFIG_USB_ALIGN_SIZE - 1)) {
-        align_buf = rt_malloc_align(USB_ALIGN_UP(size, CONFIG_USB_ALIGN_SIZE), CONFIG_USB_ALIGN_SIZE);
-        if (!align_buf) {
-            USB_LOG_ERR("serial get align buf failed\n");
-            return 0;
+    rt_size_t written = rt_ringbuffer_put(&serial->tx_rb, (const rt_uint8_t *)buffer, size);
+
+    if (written > 0) {
+        dbg_serial_write_ok++;
+        if (!serial->tx_active) {
+            usbd_serial_kick_tx(serial);
         }
-
-        usb_memcpy(align_buf, buffer, size);
-    }
-
-    usb_osal_sem_reset(serial->tx_done);
-    usbd_ep_start_write(serial->busid, serial->in_ep, align_buf, size);
-    ret = usb_osal_sem_take(serial->tx_done, 3000);
-    if (ret < 0) {
-        USB_LOG_ERR("serial write timeout\n");
-        ret = -RT_ETIMEOUT;
     } else {
-        ret = size;
+        dbg_serial_write_timeout++;
     }
 
-    if ((uint32_t)buffer & (CONFIG_USB_ALIGN_SIZE - 1)) {
-        rt_free_align(align_buf);
+    return written;
+}
+
+static void usbd_serial_kick_tx(struct usbd_serial *serial)
+{
+    if (!usb_device_is_configured(serial->busid)) {
+        serial->tx_active = 0;
+        rt_ringbuffer_reset(&serial->tx_rb);
+        return;
     }
 
-    return ret;
+    uint16_t mps = usbd_get_ep_mps(serial->busid, serial->in_ep);
+    if (!mps) mps = 64;
+
+    uint32_t avail = rt_ringbuffer_data_len(&serial->tx_rb);
+    if (avail == 0) {
+        serial->tx_active = 0;
+        return;
+    }
+
+    uint16_t to_send = (avail > mps) ? mps : (uint16_t)avail;
+
+    rt_size_t got = rt_ringbuffer_get(&serial->tx_rb, serial->tx_pkt, to_send);
+    if (got == 0) {
+        serial->tx_active = 0;
+        return;
+    }
+
+    serial->tx_active = 1;
+    dbg_serial_tx_kick++;
+    int ret = usbd_ep_start_write(serial->busid, serial->in_ep, serial->tx_pkt, got);
+    if (ret < 0) {
+        serial->tx_active = 0;
+        dbg_serial_tx_kick_fail++;
+    }
 }
 
 #ifdef RT_USING_DEVICE_OPS
@@ -185,14 +271,13 @@ rt_err_t usbd_serial_register(struct usbd_serial *serial,
 #endif
     device->user_data = data;
 
-    /* register a character device */
     ret = rt_device_register(device, serial->name, RT_DEVICE_FLAG_RDWR | RT_DEVICE_FLAG_INT_RX | RT_DEVICE_FLAG_REMOVABLE);
 
 #ifdef RT_USING_POSIX_DEVIO
-    /* set fops */
     device->fops = NULL;
 #endif
     rt_ringbuffer_init(&serial->rx_rb, serial->rx_rb_buffer, sizeof(serial->rx_rb_buffer));
+    rt_ringbuffer_init(&serial->tx_rb, serial->tx_rb_buffer, sizeof(serial->tx_rb_buffer));
 
     return ret;
 }
@@ -200,6 +285,8 @@ rt_err_t usbd_serial_register(struct usbd_serial *serial,
 void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     struct usbd_serial *serial;
+
+    dbg_serial_bulkout_cnt++;
 
     for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
         serial = &g_usbd_serial_cdc_acm[devno];
@@ -221,16 +308,20 @@ void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     struct usbd_serial *serial;
 
-    if ((nbytes % usbd_get_ep_mps(busid, ep)) == 0 && nbytes) {
-        /* send zlp */
-        usbd_ep_start_write(busid, ep, NULL, 0);
-    } else {
-        for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
-            serial = &g_usbd_serial_cdc_acm[devno];
-            if ((serial->in_ep == ep) && serial->tx_done) {
-                usb_osal_sem_give(serial->tx_done);
-                break;
-            }
+    dbg_serial_bulkin_cnt++;
+
+    for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
+        serial = &g_usbd_serial_cdc_acm[devno];
+        if (serial->in_ep == ep) {
+            /*
+             * No ZLP for CDC ACM streaming — data is consumed as a
+             * byte stream by the host CDC driver.  Sending a ZLP
+             * after MPS-aligned packets can stall the DWC2 endpoint
+             * (PKTCNT=1/XFRSIZ=0 stuck) and is unnecessary here.
+             * ChibiOS CDC likewise never sends ZLP for stream data.
+             */
+            usbd_serial_kick_tx(serial);
+            return;
         }
     }
 }
@@ -259,6 +350,7 @@ void usbd_cdc_acm_serial_init(uint8_t busid, uint8_t in_ep, uint8_t out_ep)
     serial->in_ep = in_ep;
     serial->out_ep = out_ep;
     serial->tx_done = usb_osal_sem_create(0);
+    serial->tx_active = 0;
 
     usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &serial->intf_ctrl));
     usbd_add_interface(busid, usbd_cdc_acm_init_intf(busid, &serial->intf_data));
@@ -272,4 +364,29 @@ void usbd_cdc_acm_serial_init(uint8_t busid, uint8_t in_ep, uint8_t out_ep)
     }
 
     USB_LOG_INFO("USB CDC ACM Serial Device %s initialized\n", serial->name);
+}
+
+volatile uint32_t dbg_dtr_set_cnt = 0;
+volatile uint32_t dbg_dtr_clear_cnt = 0;
+
+void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
+{
+    (void)busid;
+    (void)intf;
+    if (dtr) {
+        dbg_dtr_set_cnt++;
+        for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
+            struct usbd_serial *serial = &g_usbd_serial_cdc_acm[devno];
+            if (serial->out_ep) {
+                serial->tx_active = 0;
+                dbg_serial_rx_rearm++;
+                usbd_ep_start_read(serial->busid, serial->out_ep,
+                    g_usbd_serial_cdc_acm_rx_buf[serial->minor],
+                    usbd_get_ep_mps(serial->busid, serial->out_ep));
+                usbd_serial_kick_tx(serial);
+            }
+        }
+    } else {
+        dbg_dtr_clear_cnt++;
+    }
 }

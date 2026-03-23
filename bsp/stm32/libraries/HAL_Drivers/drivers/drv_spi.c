@@ -280,7 +280,7 @@ static rt_err_t stm32_spi_init(struct stm32_spi *spi_drv, struct rt_spi_configur
 
 static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *message)
 {
-    #define DMA_TRANS_MIN_LEN  10 /* only buffer length >= DMA_TRANS_MIN_LEN will use DMA mode */
+    #define DMA_TRANS_MIN_LEN  9999 /* disable DMA: SPI_DMAReceiveCplt hangs in SPI_EndRxTransaction BSY wait on STM32F7 */
 
     HAL_StatusTypeDef state = HAL_OK;
     rt_size_t message_length, already_send_length;
@@ -350,16 +350,15 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
 #if defined(SOC_SERIES_STM32H7) || defined(SOC_SERIES_STM32F7)
             if (RT_IS_ALIGN((rt_uint32_t)send_buf, 32) && send_buf != RT_NULL) /* aligned with 32 bytes? */
             {
-                p_txrx_buffer = (rt_uint32_t *)send_buf; /* send_buf aligns with 32 bytes, no more operations */
+                p_txrx_buffer = (rt_uint32_t *)send_buf;
             }
             else
             {
-                /* send_buf doesn't align with 32 bytes, so creat a cache buffer with 32 bytes aligned */
                 dma_aligned_buffer = (rt_uint32_t *)rt_malloc_align(send_length, 32);
                 rt_memcpy(dma_aligned_buffer, send_buf, send_length);
                 p_txrx_buffer = dma_aligned_buffer;
             }
-            rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, dma_aligned_buffer, send_length);
+            rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, p_txrx_buffer, send_length);
 #else
             if (RT_IS_ALIGN((rt_uint32_t)send_buf, 4) && send_buf != RT_NULL) /* aligned with 4 bytes? */
             {
@@ -379,16 +378,15 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
 #if defined(SOC_SERIES_STM32H7) || defined(SOC_SERIES_STM32F7)
             if (RT_IS_ALIGN((rt_uint32_t)recv_buf, 32) && recv_buf != RT_NULL) /* aligned with 32 bytes? */
             {
-                p_txrx_buffer = (rt_uint32_t *)recv_buf; /* recv_buf aligns with 32 bytes, no more operations */
+                p_txrx_buffer = (rt_uint32_t *)recv_buf;
             }
             else
             {
-                /* recv_buf doesn't align with 32 bytes, so creat a cache buffer with 32 bytes aligned */
                 dma_aligned_buffer = (rt_uint32_t *)rt_malloc_align(send_length, 32);
                 rt_memcpy(dma_aligned_buffer, recv_buf, send_length);
                 p_txrx_buffer = dma_aligned_buffer;
             }
-            rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, dma_aligned_buffer, send_length);
+            rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, p_txrx_buffer, send_length);
 #else
             if (RT_IS_ALIGN((rt_uint32_t)recv_buf, 4) && recv_buf != RT_NULL) /* aligned with 4 bytes? */
             {
@@ -491,24 +489,40 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
         }
         else
         {
-            while (HAL_SPI_GetState(spi_handle) != HAL_SPI_STATE_READY);
+            uint32_t t0 = rt_tick_get();
+            while (HAL_SPI_GetState(spi_handle) != HAL_SPI_STATE_READY)
+            {
+                if (rt_tick_get() - t0 > rt_tick_from_millisecond(50))
+                {
+                    state = HAL_ERROR;
+                    LOG_E("SPI polling timeout!");
+                    break;
+                }
+                rt_thread_yield();
+            }
         }
 
-        if(dma_aligned_buffer != RT_NULL) /* re-aligned, so need to copy the data to recv_buf */
+        if(dma_aligned_buffer != RT_NULL)
         {
             if(recv_buf != RT_NULL)
             {
 #if defined(SOC_SERIES_STM32H7) || defined(SOC_SERIES_STM32F7)
                 rt_hw_cpu_dcache_ops(RT_HW_CACHE_INVALIDATE, p_txrx_buffer, send_length);
-#endif /* SOC_SERIES_STM32H7 || SOC_SERIES_STM32F7 */
+#endif
                 rt_memcpy(recv_buf, p_txrx_buffer, send_length);
             }
 #if defined(SOC_SERIES_STM32H7) || defined(SOC_SERIES_STM32F7)
             rt_free_align(dma_aligned_buffer);
 #else
             rt_free(dma_aligned_buffer);
-#endif /* SOC_SERIES_STM32H7 || SOC_SERIES_STM32F7 */
+#endif
         }
+#if defined(SOC_SERIES_STM32H7) || defined(SOC_SERIES_STM32F7)
+        else if(recv_buf != RT_NULL && p_txrx_buffer != RT_NULL)
+        {
+            rt_hw_cpu_dcache_ops(RT_HW_CACHE_INVALIDATE, p_txrx_buffer, send_length);
+        }
+#endif
     }
 
     if (message->cs_release && !(device->config.mode & RT_SPI_NO_CS) && (device->cs_pin != PIN_NONE))

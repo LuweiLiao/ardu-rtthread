@@ -7,6 +7,40 @@
 #include "usb_dwc2_reg.h"
 #include "usb_dwc2_param.h"
 
+#ifndef __get_PRIMASK
+static inline uint32_t __local_get_PRIMASK(void)
+{
+    uint32_t result;
+    __asm volatile("MRS %0, primask" : "=r"(result));
+    return result;
+}
+#define __get_PRIMASK __local_get_PRIMASK
+#endif
+
+#ifndef __disable_irq
+static inline void __local_disable_irq(void)
+{
+    __asm volatile("cpsid i" ::: "memory");
+}
+#define __disable_irq __local_disable_irq
+#endif
+
+#ifndef __set_PRIMASK
+static inline void __local_set_PRIMASK(uint32_t priMask)
+{
+    __asm volatile("MSR primask, %0" :: "r"(priMask) : "memory");
+}
+#define __set_PRIMASK __local_set_PRIMASK
+#endif
+
+#ifndef __DSB
+static inline void __local_DSB(void)
+{
+    __asm volatile("dsb 0xF" ::: "memory");
+}
+#define __DSB __local_DSB
+#endif
+
 #define USBD_BASE (g_usbdev_bus[busid].reg_base)
 
 #define USB_OTG_GLB      ((DWC2_GlobalTypeDef *)(USBD_BASE))
@@ -352,12 +386,23 @@ void dwc2_ep_read(uint8_t busid, uint8_t *dest, uint16_t len)
     }
 }
 
+volatile uint32_t dbg_txfe_ep1_calls = 0;
+volatile uint32_t dbg_txfe_ep1_wrote = 0;
+volatile uint32_t dbg_txfe_ep1_zero = 0;
+volatile uint32_t dbg_iepint_calls = 0;
+volatile uint32_t dbg_iepint_ep1_xfrc = 0;
+volatile uint32_t dbg_diepempmsk_snap = 0;
+volatile uint32_t dbg_diepmsk_snap = 0;
+
 static void dwc2_tx_fifo_empty_procecss(uint8_t busid, uint8_t ep_idx)
 {
     uint32_t len;
     uint32_t len32b;
     uint32_t fifoemptymsk;
 
+    if (ep_idx == 1) {
+        dbg_txfe_ep1_calls++;
+    }
     len = g_dwc2_udc[busid].in_ep[ep_idx].xfer_len - g_dwc2_udc[busid].in_ep[ep_idx].actual_xfer_len;
     if (len > g_dwc2_udc[busid].in_ep[ep_idx].ep_mps) {
         len = g_dwc2_udc[busid].in_ep[ep_idx].ep_mps;
@@ -391,7 +436,10 @@ static void dwc2_tx_fifo_empty_procecss(uint8_t busid, uint8_t ep_idx)
 
     if (g_dwc2_udc[busid].in_ep[ep_idx].xfer_len <= g_dwc2_udc[busid].in_ep[ep_idx].actual_xfer_len) {
         fifoemptymsk = (uint32_t)(0x1UL << (ep_idx & 0x0f));
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
         USB_OTG_DEV->DIEPEMPMSK &= ~fifoemptymsk;
+        __set_PRIMASK(primask);
     }
 }
 
@@ -870,6 +918,51 @@ int usbd_ep_is_stalled(uint8_t busid, const uint8_t ep, uint8_t *stalled)
     return 0;
 }
 
+volatile uint32_t dbg_ep_abort_cnt = 0;
+volatile uint32_t dbg_ep_busy_cnt = 0;
+volatile uint32_t dbg_ep_recover_cnt = 0;
+
+int usbd_ep_check_busy(uint8_t busid, const uint8_t ep)
+{
+    uint8_t ep_idx = USB_EP_GET_IDX(ep);
+    if (ep_idx && (USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)) {
+        dbg_ep_busy_cnt++;
+        return 1;
+    }
+    return 0;
+}
+
+void usbd_ep_recover_stuck(uint8_t busid, const uint8_t ep)
+{
+    uint8_t ep_idx = USB_EP_GET_IDX(ep);
+    if (ep_idx == 0) {
+        return;
+    }
+    dbg_ep_recover_cnt++;
+
+    USB_OTG_DEV->DCTL |= USB_OTG_DCTL_SGINAK;
+
+    if (USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA) {
+        USB_OTG_INEP(ep_idx)->DIEPCTL |= (USB_OTG_DIEPCTL_SNAK | USB_OTG_DIEPCTL_EPDIS);
+        volatile uint32_t cnt = 0;
+        while ((USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA) && (++cnt < 200000U)) {
+            __asm volatile("nop");
+        }
+    }
+    USB_OTG_INEP(ep_idx)->DIEPINT = 0xFF;
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        USB_OTG_DEV->DIEPEMPMSK &= ~(1UL << ep_idx);
+        __set_PRIMASK(primask);
+    }
+    dwc2_flush_txfifo(busid, ep_idx);
+
+    USB_OTG_INEP(ep_idx)->DIEPCTL |= USB_OTG_DIEPCTL_SD0PID_SEVNFRM;
+
+    USB_OTG_DEV->DCTL |= USB_OTG_DCTL_CGINAK;
+}
+
 int usbd_ep_start_write(uint8_t busid, const uint8_t ep, const uint8_t *data, uint32_t data_len)
 {
     uint8_t ep_idx = USB_EP_GET_IDX(ep);
@@ -939,9 +1032,12 @@ int usbd_ep_start_write(uint8_t busid, const uint8_t ep, const uint8_t *data, ui
         USB_OTG_INEP(ep_idx)->DIEPCTL |= (USB_OTG_DIEPCTL_CNAK | USB_OTG_DIEPCTL_EPENA);
     } else {
         USB_OTG_INEP(ep_idx)->DIEPCTL |= (USB_OTG_DIEPCTL_CNAK | USB_OTG_DIEPCTL_EPENA);
-        /* Enable the Tx FIFO Empty Interrupt for this EP */
+        __DSB();
         if (data_len > 0U) {
+            uint32_t primask = __get_PRIMASK();
+            __disable_irq();
             USB_OTG_DEV->DIEPEMPMSK |= 1UL << (ep_idx & 0x0f);
+            __set_PRIMASK(primask);
         }
     }
     return 0;
@@ -1104,11 +1200,15 @@ process_setup:
         if (gint_status & USB_OTG_GINTSTS_IEPINT) {
             ep_idx = 0U;
             ep_intr = dwc2_get_ineps_intstatus(busid);
+            dbg_iepint_calls++;
+            dbg_diepempmsk_snap = USB_OTG_DEV->DIEPEMPMSK;
+            dbg_diepmsk_snap = USB_OTG_DEV->DIEPMSK;
             while (ep_intr != 0U) {
                 if ((ep_intr & 0x1U) != 0U) {
                     epint = dwc2_get_inep_intstatus(busid, ep_idx);
 
                     if ((epint & USB_OTG_DIEPINT_XFRC) == USB_OTG_DIEPINT_XFRC) {
+                        if (ep_idx == 1) { dbg_iepint_ep1_xfrc++; }
                         if (ep_idx == 0) {
                             g_dwc2_udc[busid].in_ep[ep_idx].actual_xfer_len = g_dwc2_udc[busid].in_ep[ep_idx].xfer_len - ((USB_OTG_INEP(ep_idx)->DIEPTSIZ) & USB_OTG_DIEPTSIZ_XFRSIZ);
                             g_dwc2_udc[busid].in_ep[ep_idx].xfer_len = 0;

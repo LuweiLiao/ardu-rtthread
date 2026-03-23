@@ -13,8 +13,18 @@
 #define __SYS_TIME_H__
 
 #include <rtconfig.h>
-#include <sys/types.h>
 #include <stdint.h>
+
+/* Forward-declare time_t to break circular include with newlib:
+ * newlib sys/types.h → sys/select.h → sys/time.h (here) needs time_t,
+ * but sys/types.h hasn't defined it yet at that point. */
+#ifndef __time_t_defined
+#define __time_t_defined
+#define _TIME_T_DECLARED
+typedef long time_t;
+#endif
+
+#include <sys/types.h>
 #include <time.h>
 #ifdef _WIN32
 typedef __time64_t time_t;

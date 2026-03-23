@@ -116,6 +116,8 @@ int usbd_ep_is_stalled(uint8_t busid, const uint8_t ep, uint8_t *stalled);
  * @return 0 on success, negative errno code on fail.
  */
 int usbd_ep_start_write(uint8_t busid, const uint8_t ep, const uint8_t *data, uint32_t data_len);
+int usbd_ep_check_busy(uint8_t busid, const uint8_t ep);
+void usbd_ep_recover_stuck(uint8_t busid, const uint8_t ep);
 
 /**
  * @brief Setup out ep transfer setting and start transfer.

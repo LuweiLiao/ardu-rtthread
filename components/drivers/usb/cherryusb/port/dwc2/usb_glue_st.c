@@ -196,8 +196,8 @@ const struct dwc2_user_params param_pb14_pb15 = {
 #if defined(STM32F446xx) || defined(STM32F469xx) || defined(STM32F479xx) ||                                                 \
     defined(STM32F412Zx) || defined(STM32F412Vx) || defined(STM32F412Rx) || defined(STM32F412Cx) || defined(STM32F413xx) || \
     defined(STM32F423xx)
-    .device_gccfg = (1 << 16), // fs: USB_OTG_GCCFG_PWRDWN
-    .host_gccfg = (1 << 16),   // fs: USB_OTG_GCCFG_PWRDWN
+    .device_gccfg = ((1 << 16) | (1 << 21)), // fs: USB_OTG_GCCFG_PWRDWN | USB_OTG_GCCFG_NOVBUSSENS
+    .host_gccfg = ((1 << 16) | (1 << 21)),   // fs: USB_OTG_GCCFG_PWRDWN | USB_OTG_GCCFG_NOVBUSSENS
     .b_session_valid_override = true,
 #else
     .device_gccfg = ((1 << 16) | (1 << 21)), // fs: USB_OTG_GCCFG_PWRDWN | USB_OTG_GCCFG_NOVBUSSENS hs:0
@@ -561,6 +561,13 @@ struct dwc2_instance {
 
 static usb_dwc2_irq g_usb_dwc2_irq[2];
 static uint8_t g_usb_dwc2_busid[2] = { 0, 0 };
+
+/* GDB-visible IRQ telemetry for USB enumeration debugging. */
+volatile uint32_t usb_fs_irq_count;
+volatile uint32_t usb_fs_last_gintsts;
+volatile uint32_t usb_fs_last_gintmsk;
+volatile uint32_t usb_fs_last_gotgint;
+volatile uint32_t usb_fs_last_dsts;
 static struct dwc2_instance g_dwc2_instance;
 
 #if defined(STM32F722xx) || defined(STM32F723xx) || defined(STM32F730xx) || defined(STM32F732xx) || defined(STM32F733xx)
@@ -727,14 +734,35 @@ uint32_t usbd_dwc2_get_system_clock(void)
     return SystemCoreClock;
 }
 
-void OTG_FS_IRQHandler(void)
+void __attribute__((weak)) OTG_FS_IRQHandler(void)
 {
-    g_usb_dwc2_irq[0](g_usb_dwc2_busid[0]);
+    volatile uint32_t *const fs_gotgint = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x004U);
+    volatile uint32_t *const fs_gintsts = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x014U);
+    volatile uint32_t *const fs_gintmsk = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x018U);
+    volatile uint32_t *const fs_dsts = (volatile uint32_t *)(USB_OTG_FS_PERIPH_BASE + 0x808U);
+
+    usb_fs_irq_count++;
+    usb_fs_last_gintsts = *fs_gintsts;
+    usb_fs_last_gintmsk = *fs_gintmsk;
+    usb_fs_last_gotgint = *fs_gotgint;
+    usb_fs_last_dsts = *fs_dsts;
+#if defined(HAL_PCD_MODULE_ENABLED) && !defined(HAL_HCD_MODULE_ENABLED)
+    /* Device-only STM32 builds can safely dispatch directly. This avoids
+     * early/null function-pointer faults if the IRQ arrives before the
+     * low-level glue has finished registering g_usb_dwc2_irq[0]. */
+    USBD_IRQHandler(0);
+#else
+    if (g_usb_dwc2_irq[0] != NULL) {
+        g_usb_dwc2_irq[0](g_usb_dwc2_busid[0]);
+    }
+#endif
 }
 
 void OTG_HS_IRQHandler(void)
 {
-    g_usb_dwc2_irq[1](g_usb_dwc2_busid[1]);
+    if (g_usb_dwc2_irq[1] != NULL) {
+        g_usb_dwc2_irq[1](g_usb_dwc2_busid[1]);
+    }
 }
 
 #ifdef CONFIG_USB_DCACHE_ENABLE

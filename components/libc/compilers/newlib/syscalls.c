@@ -86,10 +86,35 @@ void *_sbrk_r(struct _reent *ptr, ptrdiff_t incr)
 }
 #endif /*RT_USING_HEAP*/
 
+/* The newlib __libc_init_array shipped with some arm-none-eabi toolchains
+ * is compiled as ARM (not Thumb), which causes UNDEFINSTR on Cortex-M.
+ * Provide a Thumb-safe replacement that iterates .preinit_array and
+ * .init_array so C++ global constructors run correctly. */
+extern void (*__preinit_array_start[])(void);
+extern void (*__preinit_array_end[])(void);
+extern void (*__init_array_start[])(void);
+extern void (*__init_array_end[])(void);
+
+volatile int rtt_dbg_ctor_index = -1;
+volatile int rtt_dbg_ctor_total = 0;
+volatile void *rtt_dbg_ctor_addr = 0;
+
 void __libc_init_array(void)
 {
-    /* we not use __libc init_aray to initialize C++ objects */
-    /* __libc_init_array is ARM code, not Thumb; it will cause a hardfault. */
+    size_t count, i;
+
+    count = (size_t)(__preinit_array_end - __preinit_array_start);
+    for (i = 0; i < count; i++)
+        __preinit_array_start[i]();
+
+    count = (size_t)(__init_array_end - __init_array_start);
+    rtt_dbg_ctor_total = (int)count;
+    for (i = 0; i < count; i++) {
+        rtt_dbg_ctor_index = (int)i;
+        rtt_dbg_ctor_addr = (void *)__init_array_start[i];
+        __init_array_start[i]();
+    }
+    rtt_dbg_ctor_index = (int)count;
 }
 
 /* Reentrant versions of system calls.  */

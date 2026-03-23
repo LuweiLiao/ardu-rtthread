@@ -1,0 +1,15 @@
+import os
+from building import *
+
+cwd = GetCurrentDir()
+list = os.listdir(cwd)
+group = None
+for item in list:
+    if os.path.isfile(os.path.join(cwd, item, 'SConscript')):
+        if group is None:
+            group = SConscript(os.path.join(item, 'SConscript'))
+        else:
+            group = group + SConscript(os.path.join(item, 'SConscript'))
+if group is None:
+    group = DefineGroup('ports', [], depend = [])
+Return('group')

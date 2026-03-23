@@ -88,6 +88,12 @@ _reswitch:
 .global PendSV_Handler
 .type PendSV_Handler, %function
 PendSV_Handler:
+    LDR     r0, =rtt_dbg_pendsv_enter_lr
+    STR     lr, [r0]
+    MRS     r1, psp
+    LDR     r0, =rtt_dbg_pendsv_enter_psp
+    STR     r1, [r0]
+
     /* disable interrupt to protect context switch */
     MRS r2, PRIMASK
     CPSID   I
@@ -162,6 +168,21 @@ switch_to_thread:
 #endif
 
 pendsv_exit:
+    LDR     r0, =rtt_dbg_pendsv_exit_lr
+    STR     lr, [r0]
+    MRS     r1, psp
+    LDR     r0, =rtt_dbg_pendsv_exit_psp
+    STR     r1, [r0]
+    LDR     r3, [r1, #20]            /* stacked LR  */
+    LDR     r0, =rtt_dbg_pendsv_exit_stack_lr
+    STR     r3, [r0]
+    LDR     r3, [r1, #24]            /* stacked PC  */
+    LDR     r0, =rtt_dbg_pendsv_exit_stack_pc
+    STR     r3, [r0]
+    LDR     r3, [r1, #28]            /* stacked xPSR */
+    LDR     r0, =rtt_dbg_pendsv_exit_stack_xpsr
+    STR     r3, [r0]
+
     /* restore interrupt */
     MSR PRIMASK, r2
 
@@ -175,6 +196,12 @@ pendsv_exit:
 .global rt_hw_context_switch_to
 .type rt_hw_context_switch_to, %function
 rt_hw_context_switch_to:
+    LDR     r1, =rtt_dbg_switch_to_sp_addr
+    STR     r0, [r1]
+    LDR     r1, [r0]
+    LDR     r2, =rtt_dbg_switch_to_sp_value
+    STR     r1, [r2]
+
     LDR r1, =rt_interrupt_to_thread
     STR r0, [r1]
 
@@ -217,6 +244,10 @@ rt_hw_context_switch_to:
     CPSIE   F
     CPSIE   I
 
+    /* clear the BASEPRI register to disable masking priority */
+    MOV     r0, #0x00
+    MSR     BASEPRI, r0
+
     /* ensure PendSV exception taken place before subsequent operation */
     DSB
     ISB
@@ -233,16 +264,67 @@ rt_hw_interrupt_thread_switch:
 .global HardFault_Handler
 .type HardFault_Handler, %function
 HardFault_Handler:
+    LDR     r0, =rtt_dbg_hardfault_lr
+    STR     lr, [r0]
+    MRS     r1, msp
+    LDR     r0, =rtt_dbg_hardfault_msp
+    STR     r1, [r0]
+    MRS     r1, psp
+    LDR     r0, =rtt_dbg_hardfault_psp
+    STR     r1, [r0]
+    TST     lr, #0x10
+    BEQ     hardfault_ext_frame
+
+    LDR     r3, [r1, #20]            /* basic frame: stacked LR */
+    LDR     r0, =rtt_dbg_hardfault_stack_lr
+    STR     r3, [r0]
+    LDR     r3, [r1, #24]            /* basic frame: stacked PC */
+    LDR     r0, =rtt_dbg_hardfault_stack_pc
+    STR     r3, [r0]
+    LDR     r3, [r1, #28]            /* basic frame: stacked xPSR */
+    LDR     r0, =rtt_dbg_hardfault_stack_xpsr
+    STR     r3, [r0]
+    LDR     r0, =rtt_dbg_hardfault_frame_ext
+    MOV     r3, #0
+    STR     r3, [r0]
+    B       hardfault_frame_done
+
+hardfault_ext_frame:
+    LDR     r3, [r1, #0x5c]          /* ext frame: stacked LR */
+    LDR     r0, =rtt_dbg_hardfault_stack_lr
+    STR     r3, [r0]
+    LDR     r3, [r1, #0x60]          /* ext frame: stacked PC */
+    LDR     r0, =rtt_dbg_hardfault_stack_pc
+    STR     r3, [r0]
+    LDR     r3, [r1, #0x64]          /* ext frame: stacked xPSR */
+    LDR     r0, =rtt_dbg_hardfault_stack_xpsr
+    STR     r3, [r0]
+    LDR     r0, =rtt_dbg_hardfault_frame_ext
+    MOV     r3, #1
+    STR     r3, [r0]
+
+hardfault_frame_done:
+
     /* get current context */
     MRS     r0, msp                 /* get fault context from handler. */
     TST     lr, #0x04               /* if(!EXC_RETURN[2]) */
     BEQ     _get_sp_done
     MRS     r0, psp                 /* get fault context from thread. */
 _get_sp_done:
+#if defined (__VFP_FP__) && !defined(__SOFTFP__)
+    TST     lr, #0x10               /* if(!EXC_RETURN[4]) */
+    IT      EQ
+    VSTMDBEQ r0!, {d8 - d15}        /* push FPU register s16~s31 */
+#endif
 
     STMFD   r0!, {r4 - r11}         /* push r4 - r11 register */
+
 #if defined (__VFP_FP__) && !defined(__SOFTFP__)
-    STMFD   r0!, {lr}               /* push dummy for flag */
+    MOV     r4, #0x00
+    TST     lr, #0x10               /* if(!EXC_RETURN[4]) */
+    IT      EQ
+    MOVEQ   r4, #0x01               /* flag = 1 */
+    STMFD   r0!, {r4}               /* push flag */
 #endif
     STMFD   r0!, {lr}               /* push exec_return register */
 

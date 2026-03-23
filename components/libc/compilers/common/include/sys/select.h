@@ -13,6 +13,18 @@
 #define __SYS_SELECT_H__
 
 #include <rtconfig.h>
+#include <stdint.h>
+/* Break circular include: newlib sys/types.h → sys/select.h → sys/time.h.
+ * Provide the types that time.h needs before including it. */
+#ifndef __clock_t_defined
+#define __clock_t_defined
+#define _CLOCK_T_DECLARED
+typedef unsigned long clock_t;
+#endif
+#ifndef __suseconds_t_defined
+typedef long suseconds_t;
+#define __suseconds_t_defined
+#endif
 #include <sys/types.h>
 #include <sys/time.h>
 #include <string.h>
