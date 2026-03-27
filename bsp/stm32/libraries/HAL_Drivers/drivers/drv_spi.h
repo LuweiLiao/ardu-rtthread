@@ -47,6 +47,13 @@ struct stm32_spi_device
 #define SPI_USING_RX_DMA_FLAG   (1<<0)
 #define SPI_USING_TX_DMA_FLAG   (1<<1)
 
+/*
+ * Forward-declare the LLD bus context so drv_spi.h does not need to pull in
+ * drv_spi_lld.h (which is STM32F7-specific).  The concrete type is resolved
+ * in drv_spi.c and drv_spi_lld.c which both include drv_spi_lld.h directly.
+ */
+struct spi_lld_bus;
+
 /* stm32 spi dirver class */
 struct stm32_spi
 {
@@ -64,6 +71,13 @@ struct stm32_spi
     struct rt_spi_bus spi_bus;
 
     struct rt_completion cpt;
+
+    /*
+     * Optional Low-Level DMA context (STM32F7 only).
+     * When non-NULL, spixfer() calls spi_lld_xfer() instead of the HAL DMA
+     * path, eliminating the SPI_EndRxTxTransaction busy-wait from the ISR.
+     */
+    struct spi_lld_bus *lld;
 };
 
 #endif /*__DRV_SPI_H__ */

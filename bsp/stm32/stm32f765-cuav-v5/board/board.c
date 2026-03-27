@@ -118,5 +118,4 @@ void SystemClock_Config(void)
   clock_configured = 1;
 }
 
-/* _Error_Handler is defined in drv_common.c - don't redefine here */
-
+/* _Error_Handler is provided by drv_common.c - no need to redefine here */

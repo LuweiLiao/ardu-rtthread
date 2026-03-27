@@ -6,11 +6,11 @@
 /* Program Entry, set to mark it as "used" and avoid gc */
 MEMORY
 {
-    ROM (rx) : ORIGIN = 0x08008000, LENGTH = 992k /* 992KB app flash, 32KB bootloader at 0x08000000 */
+    ROM (rx) : ORIGIN = 0x08008000, LENGTH = 2016k /* 2016KB app flash, 32KB bootloader at 0x08000000 */
     RAM (rw) : ORIGIN = 0x20000000, LENGTH =  512k /* 512K sram */
 }
 ENTRY(Reset_Handler)
-_system_stack_size = 0x800;
+_system_stack_size = 0x1000;
 
 SECTIONS
 {

@@ -45,12 +45,11 @@
 
 /* ########################## Module Selection ############################## */
 /**
-  * @brief This is the list of modules to be used in the HAL driver 
+  * @brief This is the list of modules to be used in the HAL driver
   */
 #define HAL_MODULE_ENABLED
 
-/* ART Accelerator enable - required for STM32F7 HAL compilation */
-#define ART_ACCELERATOR_ENABLE 1U
+#define ART_ACCELERATOR_ENABLE 1U  /* Fix for stm32f7xx_hal.c compilation */
 
 /* #define HAL_ADC_MODULE_ENABLED   */
 /* #define HAL_CRYP_MODULE_ENABLED   */
@@ -75,7 +74,7 @@
 /* #define HAL_RNG_MODULE_ENABLED   */
 /* #define HAL_RTC_MODULE_ENABLED   */
 /* #define HAL_SAI_MODULE_ENABLED   */
-/* #define HAL_SD_MODULE_ENABLED   */
+#define HAL_SD_MODULE_ENABLED
 /* #define HAL_MMC_MODULE_ENABLED   */
 /* #define HAL_SPDIFRX_MODULE_ENABLED   */
 #define HAL_SPI_MODULE_ENABLED
@@ -164,7 +163,7 @@
 #define  VDD_VALUE                    ((uint32_t)3300U) /*!< Value of VDD in mv */
 #define  TICK_INT_PRIORITY            ((uint32_t)0U) /*!< tick interrupt priority */
 #define  USE_RTOS                     0U
-#define  PREFETCH_ENABLE              0U
+#define  PREFETCH_ENABLE              1U
 #define  ART_ACCLERATOR_ENABLE        0U /* To enable instruction cache and prefetch */
 
 /* ########################## Assert Selection ############################## */

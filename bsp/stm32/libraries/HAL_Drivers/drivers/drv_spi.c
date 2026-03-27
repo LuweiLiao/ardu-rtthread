@@ -29,6 +29,12 @@
 #define LOG_TAG              "drv.spi"
 #include <drv_log.h>
 
+/* STM32F7: include the Low-Level DMA driver to eliminate the HAL
+ * SPI_EndRxTxTransaction() busy-wait from the DMA ISR. */
+#if defined(SOC_SERIES_STM32F7)
+#include "drv_spi_lld.h"
+#endif
+
 enum
 {
 #ifdef BSP_USING_SPI1
@@ -252,8 +258,10 @@ static rt_err_t stm32_spi_init(struct stm32_spi *spi_drv, struct rt_spi_configur
 
         __HAL_LINKDMA(&spi_drv->handle, hdmarx, spi_drv->dma.handle_rx);
 
-        /* NVIC configuration for DMA transfer complete interrupt */
-        HAL_NVIC_SetPriority(spi_drv->config->dma_rx->dma_irq, 0, 0);
+        /* NVIC configuration for DMA transfer complete interrupt
+         * Priority 5: below RT-Thread kernel critical section threshold,
+         * same group as TX to prevent DMA RX/TX nesting each other */
+        HAL_NVIC_SetPriority(spi_drv->config->dma_rx->dma_irq, 5, 0);
         HAL_NVIC_EnableIRQ(spi_drv->config->dma_rx->dma_irq);
     }
 
@@ -263,14 +271,15 @@ static rt_err_t stm32_spi_init(struct stm32_spi *spi_drv, struct rt_spi_configur
 
         __HAL_LINKDMA(&spi_drv->handle, hdmatx, spi_drv->dma.handle_tx);
 
-        /* NVIC configuration for DMA transfer complete interrupt */
-        HAL_NVIC_SetPriority(spi_drv->config->dma_tx->dma_irq, 1, 0);
+        /* NVIC configuration for DMA transfer complete interrupt
+         * Priority 5: same group as RX to prevent nesting */
+        HAL_NVIC_SetPriority(spi_drv->config->dma_tx->dma_irq, 5, 1);
         HAL_NVIC_EnableIRQ(spi_drv->config->dma_tx->dma_irq);
     }
 
     if(spi_drv->spi_dma_flag & SPI_USING_TX_DMA_FLAG || spi_drv->spi_dma_flag & SPI_USING_RX_DMA_FLAG)
     {
-        HAL_NVIC_SetPriority(spi_drv->config->irq_type, 2, 0);
+        HAL_NVIC_SetPriority(spi_drv->config->irq_type, 5, 2);
         HAL_NVIC_EnableIRQ(spi_drv->config->irq_type);
     }
 
@@ -280,7 +289,11 @@ static rt_err_t stm32_spi_init(struct stm32_spi *spi_drv, struct rt_spi_configur
 
 static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *message)
 {
-    #define DMA_TRANS_MIN_LEN  9999 /* disable DMA: SPI_DMAReceiveCplt hangs in SPI_EndRxTransaction BSY wait on STM32F7 */
+    /*
+     * Keep DMA threshold conservative to avoid setup-stage stalls while still
+     * reducing polling overhead on medium/large transfers.
+     */
+    #define DMA_TRANS_MIN_LEN  16
 
     HAL_StatusTypeDef state = HAL_OK;
     rt_size_t message_length, already_send_length;
@@ -345,7 +358,8 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
         rt_uint32_t* dma_aligned_buffer = RT_NULL;
         rt_uint32_t* p_txrx_buffer = RT_NULL;
 
-        if ((spi_drv->spi_dma_flag & SPI_USING_TX_DMA_FLAG) && (send_length >= DMA_TRANS_MIN_LEN))
+        if ((spi_drv->spi_dma_flag & SPI_USING_TX_DMA_FLAG) && (send_length >= DMA_TRANS_MIN_LEN)
+            && message->send_buf != RT_NULL)
         {
 #if defined(SOC_SERIES_STM32H7) || defined(SOC_SERIES_STM32F7)
             if (RT_IS_ALIGN((rt_uint32_t)send_buf, 32) && send_buf != RT_NULL) /* aligned with 32 bytes? */
@@ -355,10 +369,21 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             else
             {
                 dma_aligned_buffer = (rt_uint32_t *)rt_malloc_align(send_length, 32);
-                rt_memcpy(dma_aligned_buffer, send_buf, send_length);
-                p_txrx_buffer = dma_aligned_buffer;
+                if (dma_aligned_buffer == RT_NULL)
+                {
+                    /* malloc failed: fall back to direct pointer (best effort) */
+                    p_txrx_buffer = (rt_uint32_t *)send_buf;
+                }
+                else
+                {
+                    rt_memcpy(dma_aligned_buffer, send_buf, send_length);
+                    p_txrx_buffer = dma_aligned_buffer;
+                }
             }
-            rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, p_txrx_buffer, send_length);
+            if (p_txrx_buffer != RT_NULL)
+            {
+                rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, p_txrx_buffer, send_length);
+            }
 #else
             if (RT_IS_ALIGN((rt_uint32_t)send_buf, 4) && send_buf != RT_NULL) /* aligned with 4 bytes? */
             {
@@ -368,12 +393,20 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             {
                 /* send_buf doesn't align with 4 bytes, so creat a cache buffer with 4 bytes aligned */
                 dma_aligned_buffer = (rt_uint32_t *)rt_malloc(send_length); /* aligned with RT_ALIGN_SIZE (8 bytes by default) */
-                rt_memcpy(dma_aligned_buffer, send_buf, send_length);
-                p_txrx_buffer = dma_aligned_buffer;
+                if (dma_aligned_buffer != RT_NULL)
+                {
+                    rt_memcpy(dma_aligned_buffer, send_buf, send_length);
+                    p_txrx_buffer = dma_aligned_buffer;
+                }
+                else
+                {
+                    p_txrx_buffer = (rt_uint32_t *)send_buf;
+                }
             }
 #endif /* SOC_SERIES_STM32H7 || SOC_SERIES_STM32F7 */
         }
-        else if ((spi_drv->spi_dma_flag & SPI_USING_RX_DMA_FLAG) && (send_length >= DMA_TRANS_MIN_LEN))
+        else if ((spi_drv->spi_dma_flag & SPI_USING_RX_DMA_FLAG) && (send_length >= DMA_TRANS_MIN_LEN)
+                 && message->recv_buf != RT_NULL && message->send_buf == RT_NULL)
         {
 #if defined(SOC_SERIES_STM32H7) || defined(SOC_SERIES_STM32F7)
             if (RT_IS_ALIGN((rt_uint32_t)recv_buf, 32) && recv_buf != RT_NULL) /* aligned with 32 bytes? */
@@ -383,10 +416,20 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             else
             {
                 dma_aligned_buffer = (rt_uint32_t *)rt_malloc_align(send_length, 32);
-                rt_memcpy(dma_aligned_buffer, recv_buf, send_length);
-                p_txrx_buffer = dma_aligned_buffer;
+                if (dma_aligned_buffer == RT_NULL)
+                {
+                    p_txrx_buffer = (rt_uint32_t *)recv_buf;
+                }
+                else
+                {
+                    rt_memcpy(dma_aligned_buffer, recv_buf, send_length);
+                    p_txrx_buffer = dma_aligned_buffer;
+                }
             }
-            rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, p_txrx_buffer, send_length);
+            if (p_txrx_buffer != RT_NULL)
+            {
+                rt_hw_cpu_dcache_ops(RT_HW_CACHE_FLUSH, p_txrx_buffer, send_length);
+            }
 #else
             if (RT_IS_ALIGN((rt_uint32_t)recv_buf, 4) && recv_buf != RT_NULL) /* aligned with 4 bytes? */
             {
@@ -407,7 +450,20 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
         {
             if ((spi_drv->spi_dma_flag & SPI_USING_TX_DMA_FLAG) && (spi_drv->spi_dma_flag & SPI_USING_RX_DMA_FLAG) && (send_length >= DMA_TRANS_MIN_LEN))
             {
-                state = HAL_SPI_TransmitReceive_DMA(spi_handle, (uint8_t *)p_txrx_buffer, (uint8_t *)p_txrx_buffer, send_length);
+#if defined(SOC_SERIES_STM32F7)
+                /* LLD path: no busy-wait in ISR */
+                if (spi_drv->lld != RT_NULL)
+                {
+                    state = (spi_lld_xfer(spi_drv->lld,
+                                          (const uint8_t *)p_txrx_buffer,
+                                          (uint8_t *)p_txrx_buffer,
+                                          send_length) == RT_EOK) ? HAL_OK : HAL_ERROR;
+                }
+                else
+#endif
+                {
+                    state = HAL_SPI_TransmitReceive_DMA(spi_handle, (uint8_t *)p_txrx_buffer, (uint8_t *)p_txrx_buffer, send_length);
+                }
             }
             else if ((spi_drv->spi_dma_flag & SPI_USING_TX_DMA_FLAG) && (send_length >= DMA_TRANS_MIN_LEN))
             {
@@ -447,7 +503,35 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             rt_memset((uint8_t *)recv_buf, 0xff, send_length);
             if ((spi_drv->spi_dma_flag & SPI_USING_RX_DMA_FLAG) && (send_length >= DMA_TRANS_MIN_LEN))
             {
-                state = HAL_SPI_Receive_DMA(spi_handle, (uint8_t *)p_txrx_buffer, send_length);
+#if defined(SOC_SERIES_STM32F7)
+                /* LLD path: for RX-only, use full-duplex LLD with dummy TX
+                 * (recv_buf is pre-filled with 0xFF which serves as dummy TX). */
+                if (spi_drv->lld != RT_NULL &&
+                    (spi_drv->spi_dma_flag & SPI_USING_TX_DMA_FLAG))
+                {
+                    state = (spi_lld_xfer(spi_drv->lld,
+                                          (const uint8_t *)p_txrx_buffer,
+                                          (uint8_t *)p_txrx_buffer,
+                                          send_length) == RT_EOK) ? HAL_OK : HAL_ERROR;
+                }
+                else
+#endif
+                if (spi_drv->spi_dma_flag & SPI_USING_TX_DMA_FLAG)
+                {
+                    /*
+                     * STM32F7 workaround: HAL_SPI_Receive_DMA hangs in
+                     * SPI_EndRxTransaction BSY wait. Use TransmitReceive_DMA
+                     * with dummy TX (0xFF already in recv_buf) to avoid BSY hang.
+                     */
+                    state = HAL_SPI_TransmitReceive_DMA(spi_handle,
+                                                        (uint8_t *)p_txrx_buffer,
+                                                        (uint8_t *)p_txrx_buffer,
+                                                        send_length);
+                }
+                else
+                {
+                    state = HAL_SPI_Receive_DMA(spi_handle, (uint8_t *)p_txrx_buffer, send_length);
+                }
             }
             else
             {
@@ -474,17 +558,57 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
             LOG_D("%s transfer done", spi_drv->config->bus_name);
         }
 
-        /* For simplicity reasons, this example is just waiting till the end of the
-           transfer, but application may perform other tasks while transfer operation
-           is ongoing. */
+        /*
+         * Wait for DMA transfer completion.
+         * LLD path: spi_lld_xfer() already blocked internally and polled BSY —
+         *           skip the HAL completion wait entirely.
+         * HAL path: wait on rt_completion (signaled from DMA TC IRQ callback),
+         *           then poll FTLVL/BSY in thread context.
+         */
         if ((spi_drv->spi_dma_flag & (SPI_USING_TX_DMA_FLAG | SPI_USING_RX_DMA_FLAG)) && (send_length >= DMA_TRANS_MIN_LEN))
         {
-            /* blocking the thread,and the other tasks can run */
-            if (rt_completion_wait(&spi_drv->cpt, 1000) != RT_EOK)
+#if defined(SOC_SERIES_STM32F7)
+            if (spi_drv->lld != RT_NULL)
             {
-                state = HAL_ERROR;
-                LOG_E("wait for DMA interrupt overtime!");
-                break;
+                /* LLD already completed; state was set by spi_lld_xfer() above */
+            }
+            else
+#endif
+            {
+                if (rt_completion_wait(&spi_drv->cpt, 1000) != RT_EOK)
+                {
+                    state = HAL_ERROR;
+                    LOG_E("wait for DMA interrupt overtime!");
+                    break;
+                }
+                /* Poll FTLVL + BSY in thread context (moved from ISR) */
+                {
+                    const rt_tick_t t0 = rt_tick_get();
+                    const rt_tick_t wait_ticks = rt_tick_from_millisecond(2);
+
+                    while (__HAL_SPI_GET_FLAG(spi_handle, SPI_FLAG_FTLVL) != SPI_FTLVL_EMPTY)
+                    {
+                        if ((rt_tick_get() - t0) > wait_ticks)
+                        {
+                            LOG_E("SPI DMA tail wait timeout: FTLVL not empty");
+                            break;
+                        }
+                        rt_thread_yield();
+                    }
+                    if (state == HAL_OK)
+                    {
+                        const rt_tick_t t1 = rt_tick_get();
+                        while (__HAL_SPI_GET_FLAG(spi_handle, SPI_FLAG_BSY))
+                        {
+                            if ((rt_tick_get() - t1) > wait_ticks)
+                            {
+                                LOG_E("SPI DMA tail wait timeout: BSY not cleared");
+                                break;
+                            }
+                            rt_thread_yield();
+                        }
+                    }
+                }
             }
         }
         else
@@ -548,7 +672,6 @@ static rt_err_t spi_configure(struct rt_spi_device *device,
 
     struct stm32_spi *spi_drv =  rt_container_of(device->bus, struct stm32_spi, spi_bus);
     spi_drv->cfg = configuration;
-    rt_kprintf("@spi_configure\n");
 
     return stm32_spi_init(spi_drv, configuration);
 }
@@ -657,8 +780,26 @@ static int rt_hw_spi_bus_init(void)
             }
         }
 
-        /* initialize completion object */
+        /* initialize completion object (HAL DMA path fallback) */
         rt_completion_init(&spi_bus_obj[i].cpt);
+
+        /* STM32F7: attach LLD context for buses with both TX and RX DMA */
+#if defined(SOC_SERIES_STM32F7)
+        spi_bus_obj[i].lld = RT_NULL;
+        if ((spi_bus_obj[i].spi_dma_flag & (SPI_USING_TX_DMA_FLAG | SPI_USING_RX_DMA_FLAG)) ==
+            (SPI_USING_TX_DMA_FLAG | SPI_USING_RX_DMA_FLAG))
+        {
+            /* spi_lld_register() is called from board-level init (rt_board_init.c)
+             * after the HAL DMA streams are configured.  At this point the LLD
+             * context may already be registered; look it up now and attach. */
+            spi_lld_bus_t *lld = spi_lld_lookup(spi_config[i].Instance);
+            if (lld != RT_NULL)
+            {
+                spi_bus_obj[i].lld = lld;
+                LOG_I("%s: LLD DMA attached", spi_config[i].bus_name);
+            }
+        }
+#endif
 
         result = rt_spi_bus_register(&spi_bus_obj[i].spi_bus, spi_config[i].bus_name, &stm_spi_ops);
         RT_ASSERT(result == RT_EOK);
@@ -759,12 +900,17 @@ void SPI1_IRQHandler(void)
   */
 void SPI1_DMA_RX_IRQHandler(void)
 {
-    /* enter interrupt */
     rt_interrupt_enter();
-
-    HAL_DMA_IRQHandler(&spi_bus_obj[SPI1_INDEX].dma.handle_rx);
-
-    /* leave interrupt */
+#if defined(SOC_SERIES_STM32F7)
+    if (spi_bus_obj[SPI1_INDEX].lld != RT_NULL)
+    {
+        spi_lld_dma_rx_irq(spi_bus_obj[SPI1_INDEX].lld);
+    }
+    else
+#endif
+    {
+        HAL_DMA_IRQHandler(&spi_bus_obj[SPI1_INDEX].dma.handle_rx);
+    }
     rt_interrupt_leave();
 }
 #endif
@@ -777,12 +923,17 @@ void SPI1_DMA_RX_IRQHandler(void)
   */
 void SPI1_DMA_TX_IRQHandler(void)
 {
-    /* enter interrupt */
     rt_interrupt_enter();
-
-    HAL_DMA_IRQHandler(&spi_bus_obj[SPI1_INDEX].dma.handle_tx);
-
-    /* leave interrupt */
+#if defined(SOC_SERIES_STM32F7)
+    if (spi_bus_obj[SPI1_INDEX].lld != RT_NULL)
+    {
+        spi_lld_dma_tx_irq(spi_bus_obj[SPI1_INDEX].lld);
+    }
+    else
+#endif
+    {
+        HAL_DMA_IRQHandler(&spi_bus_obj[SPI1_INDEX].dma.handle_tx);
+    }
     rt_interrupt_leave();
 }
 #endif /* defined(BSP_USING_SPI1) && defined(BSP_SPI_USING_DMA) */

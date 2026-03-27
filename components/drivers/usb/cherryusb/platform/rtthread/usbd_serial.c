@@ -69,6 +69,9 @@ void usbd_serial_reset_tx(void)
         struct usbd_serial *serial = &g_usbd_serial_cdc_acm[devno];
         serial->tx_active = 0;
         rt_ringbuffer_reset(&serial->tx_rb);
+        if (serial->in_ep) {
+            usbd_ep_recover_stuck(serial->busid, serial->in_ep);
+        }
         if (serial->out_ep) {
             dbg_serial_rx_rearm++;
             usbd_ep_start_read(serial->busid, serial->out_ep,
@@ -368,6 +371,12 @@ void usbd_cdc_acm_serial_init(uint8_t busid, uint8_t in_ep, uint8_t out_ep)
 
 volatile uint32_t dbg_dtr_set_cnt = 0;
 volatile uint32_t dbg_dtr_clear_cnt = 0;
+static volatile uint8_t g_dtr_active = 0;
+
+bool usb_cdc_dtr_active(void)
+{
+    return g_dtr_active != 0;
+}
 
 void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
 {
@@ -375,18 +384,31 @@ void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
     (void)intf;
     if (dtr) {
         dbg_dtr_set_cnt++;
+        g_dtr_active = 1;
         for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
             struct usbd_serial *serial = &g_usbd_serial_cdc_acm[devno];
+            if (serial->in_ep) {
+                usbd_ep_recover_stuck(serial->busid, serial->in_ep);
+            }
+            serial->tx_active = 0;
+            rt_ringbuffer_reset(&serial->tx_rb);
             if (serial->out_ep) {
-                serial->tx_active = 0;
                 dbg_serial_rx_rearm++;
                 usbd_ep_start_read(serial->busid, serial->out_ep,
                     g_usbd_serial_cdc_acm_rx_buf[serial->minor],
                     usbd_get_ep_mps(serial->busid, serial->out_ep));
-                usbd_serial_kick_tx(serial);
             }
         }
     } else {
         dbg_dtr_clear_cnt++;
+        g_dtr_active = 0;
+        for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
+            struct usbd_serial *serial = &g_usbd_serial_cdc_acm[devno];
+            if (serial->in_ep) {
+                usbd_ep_recover_stuck(serial->busid, serial->in_ep);
+            }
+            serial->tx_active = 0;
+            rt_ringbuffer_reset(&serial->tx_rb);
+        }
     }
 }

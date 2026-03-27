@@ -114,6 +114,7 @@ static void usbd_event_handler(uint8_t busid, uint8_t event)
             usb_event_connected_count++;
             break;
         case USBD_EVENT_DISCONNECTED:
+            usbd_serial_reset_tx();
             break;
         case USBD_EVENT_RESUME:
             usbd_serial_reset_tx();
