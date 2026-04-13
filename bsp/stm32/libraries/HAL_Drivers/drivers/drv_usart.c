@@ -331,6 +331,20 @@ static rt_err_t stm32_control(struct rt_serial_device *serial, int cmd, void *ar
         break;
     }
 
+    /* Custom command for runtime baud rate change (used by AP_IOMCU) */
+    case 0x1000:
+    {
+        rt_uint32_t new_baud = *(rt_uint32_t *)arg;
+        if (new_baud == 0)
+            return -RT_ERROR;
+        uart->handle.Init.BaudRate = new_baud;
+        if (HAL_UART_Init(&(uart->handle)) != HAL_OK)
+        {
+            return -RT_ERROR;
+        }
+        break;
+    }
+
     default:
         break;
     }

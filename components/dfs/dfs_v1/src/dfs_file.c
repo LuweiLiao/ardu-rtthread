@@ -30,7 +30,7 @@ static struct dfs_vnode_mgr dfs_fm;
 
 void dfs_fm_lock(void)
 {
-    rt_mutex_take(&dfs_fm.lock, RT_WAITING_FOREVER);
+    rt_mutex_take(&dfs_fm.lock, 5000);  /* 5s timeout — was RT_WAITING_FOREVER which blocked IO thread watchdog */
 }
 
 void dfs_fm_unlock(void)

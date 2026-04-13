@@ -49,6 +49,25 @@ typedef struct spi_lld_bus {
     volatile uint8_t    error;
 } spi_lld_bus_t;
 
+typedef struct {
+    volatile uint32_t init_count;
+    volatile uint32_t xfer_count;
+    volatile uint32_t rx_irq_count;
+    volatile uint32_t tx_irq_count;
+    volatile uint32_t dma_timeout_count;
+    volatile uint32_t dma_error_count;
+    volatile uint32_t bsy_timeout_count;
+    volatile uint32_t last_len;
+    volatile uint32_t last_sr;
+    volatile uint32_t last_cr2;
+    volatile uint32_t last_error;
+} spi_lld_debug_stats_t;
+
+#define SPI_LLD_DEBUG_ERR_NONE         0U
+#define SPI_LLD_DEBUG_ERR_DMA_TIMEOUT  1U
+#define SPI_LLD_DEBUG_ERR_DMA_ERROR    2U
+#define SPI_LLD_DEBUG_ERR_BSY_TIMEOUT  3U
+
 /*
  * Initialise one LLD bus context and enable NVIC vectors.
  * Must be called after HAL_SPI_Init() for the same bus so the SPI peripheral
@@ -81,6 +100,9 @@ spi_lld_bus_t *spi_lld_lookup(const SPI_TypeDef *spi);
  * Register an LLD context (called once per bus, typically from board init).
  */
 void spi_lld_register(spi_lld_bus_t *lld);
+
+extern spi_lld_debug_stats_t g_spi1_lld_stats;
+extern spi_lld_debug_stats_t g_spi4_lld_stats;
 
 #ifdef __cplusplus
 }

@@ -41,6 +41,21 @@
 static spi_lld_bus_t *s_buses[SPI_LLD_MAX_BUSES];
 static uint32_t       s_bus_count;
 
+spi_lld_debug_stats_t g_spi1_lld_stats = {};
+spi_lld_debug_stats_t g_spi4_lld_stats = {};
+volatile uint32_t g_spi1_clock_restores = 0; /* counts how many times SPI1EN was re-enabled */
+
+static inline spi_lld_debug_stats_t *_stats_for_spi(const SPI_TypeDef *spi)
+{
+    if (spi == SPI1) {
+        return &g_spi1_lld_stats;
+    }
+    if (spi == SPI4) {
+        return &g_spi4_lld_stats;
+    }
+    return RT_NULL;
+}
+
 void spi_lld_register(spi_lld_bus_t *lld)
 {
     RT_ASSERT(lld != RT_NULL);
@@ -131,6 +146,14 @@ rt_err_t spi_lld_bus_init(spi_lld_bus_t *lld)
 {
     RT_ASSERT(lld && lld->spi && lld->dma_rx && lld->dma_tx);
 
+    spi_lld_debug_stats_t *stats = _stats_for_spi(lld->spi);
+    if (stats != RT_NULL) {
+        stats->init_count++;
+        stats->last_sr = lld->spi->SR;
+        stats->last_cr2 = lld->spi->CR2;
+        stats->last_error = SPI_LLD_DEBUG_ERR_NONE;
+    }
+
     rt_completion_init(&lld->cpt);
     lld->error = 0;
 
@@ -213,6 +236,29 @@ rt_err_t spi_lld_xfer(spi_lld_bus_t *lld,
     RT_ASSERT(lld != RT_NULL && len > 0);
 
     SPI_TypeDef *spi = lld->spi;
+    spi_lld_debug_stats_t *stats = _stats_for_spi(spi);
+
+    /* Re-enable peripheral clock if disabled.  On some RT-Thread /
+     * STM32F7 configurations the SPI1 clock (APB2ENR bit 12) gets
+     * cleared after the initial IMU probe completes, preventing any
+     * further SPI1 access until the clock is re-enabled here.
+     * Using |= is a no-op when the bit is already set. */
+    if (spi == SPI1) {
+        if (!(RCC->APB2ENR & RCC_APB2ENR_SPI1EN)) g_spi1_clock_restores++;
+        RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
+    }
+    else if (spi == SPI2) RCC->APB1ENR |= RCC_APB1ENR_SPI2EN;
+    else if (spi == SPI3) RCC->APB1ENR |= RCC_APB1ENR_SPI3EN;
+    else if (spi == SPI4) RCC->APB2ENR |= RCC_APB2ENR_SPI4EN;
+    else if (spi == SPI5) RCC->APB2ENR |= RCC_APB2ENR_SPI5EN;
+
+    if (stats != RT_NULL) {
+        stats->xfer_count++;
+        stats->last_len = len;
+        stats->last_sr = spi->SR;
+        stats->last_cr2 = spi->CR2;
+        stats->last_error = SPI_LLD_DEBUG_ERR_NONE;
+    }
     lld->error = 0;
 
     /* Flush any stale SPI FIFO data */
@@ -223,13 +269,102 @@ rt_err_t spi_lld_xfer(spi_lld_bus_t *lld,
     _setup_rx_stream(lld, buf_rx, len);
     _setup_tx_stream(lld, buf_tx, len);
 
-    /* Enable SPI DMA requests (TX and RX together to start the clock) */
+    /* Enable SPI peripheral and DMA requests (TX and RX together to start the clock).
+     * HAL_SPI_Init() does NOT set SPE — only the HAL transfer functions do.
+     * The LLD bypasses those, so we must ensure SPE is set here.
+     * Also ensure FRXTH=1 (RX FIFO threshold at 1/4 = 1 byte) so DMA requests
+     * fire per-byte rather than waiting for 2 bytes.  The drv_spi.c configure()
+     * path sets this, but HAL_SPI_Init() may clear it via MODIFY_REG. */
+    SET_BIT(spi->CR2, SPI_CR2_FRXTH);
+    SET_BIT(spi->CR1, SPI_CR1_SPE);
     SET_BIT(spi->CR2, SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
+
+    /*
+     * WORKAROUND: On some STM32F7 configurations, the RX DMA stream never
+     * fires its transfer-complete interrupt even though the TX DMA completes
+     * and the RX FIFO contains data (FRLVL > 0).  Root cause unknown.
+     * Poll the RX FIFO level and manually drain data if DMA stalls.
+     */
+    {
+        const rt_tick_t t0 = rt_tick_get();
+        while (rt_tick_get() - t0 < rt_tick_from_millisecond(50))
+        {
+            /* Check if RX DMA completed (NDTR reached 0) */
+            if ((lld->dma_rx->CR & DMA_SxCR_EN) == 0 || lld->dma_rx->NDTR == 0)
+                goto dma_rx_ok;
+
+            /* If TX DMA completed and RX FIFO has all expected data, drain it manually */
+            if ((lld->dma_tx->CR & DMA_SxCR_EN) == 0)
+            {
+                uint32_t rx_level = (spi->SR >> 9) & 0x3;  /* FRLVL[1:0] */
+                if (rx_level > 0 && lld->dma_rx->NDTR == len)
+                {
+                    /* DMA RX never started — drain FIFO manually */
+                    for (uint16_t i = 0; i < len; i++)
+                    {
+                        while (!(spi->SR & SPI_SR_RXNE)) { __NOP(); }
+                        buf_rx[i] = (uint8_t)spi->DR;
+                    }
+                    /* Disable streams, clear flags */
+                    _disable_stream_wait(lld->dma_rx);
+                    _disable_stream_wait(lld->dma_tx);
+                    *lld->rx_ifcr = lld->rx_all_mask;
+                    *lld->tx_ifcr = lld->tx_all_mask;
+                    CLEAR_BIT(spi->CR2, SPI_CR2_RXDMAEN | SPI_CR2_TXDMAEN);
+                    CLEAR_BIT(spi->CR1, SPI_CR1_SPE);
+                    if (stats != RT_NULL) stats->last_error = SPI_LLD_DEBUG_ERR_NONE;
+                    return RT_EOK;
+                }
+            }
+            rt_thread_yield();
+        }
+    }
+dma_rx_ok:
+    ;
+
+    /* Determine DMA controller for this bus (for ISR/IFCR register dump) */
+    DMA_TypeDef *dma_rx_ctrl = ((uint32_t)lld->dma_rx < (uint32_t)DMA2_Stream0) ? DMA1 : DMA2;
+    (void)dma_rx_ctrl; /* used only in debug prints below */
 
     /* Block caller thread until RX-done ISR fires */
     rt_err_t err = rt_completion_wait(&lld->cpt, rt_tick_from_millisecond(100));
     if (err != RT_EOK)
     {
+        if (stats != RT_NULL) {
+            stats->dma_timeout_count++;
+            stats->last_sr = spi->SR;
+            stats->last_cr2 = spi->CR2;
+            stats->last_error = SPI_LLD_DEBUG_ERR_DMA_TIMEOUT;
+        }
+        /* Dump hardware state for root-cause analysis */
+        rt_kprintf("[SPI-LLD-TIMEOUT] spi=%p len=%u\n", spi, (unsigned)len);
+        rt_kprintf("  SPI CR1=0x%08x CR2=0x%08x SR=0x%08x\n",
+                   (unsigned)spi->CR1, (unsigned)spi->CR2, (unsigned)spi->SR);
+        rt_kprintf("  RX stream=%p CR=0x%08x NDTR=%u M0AR=0x%08x PAR=0x%08x\n",
+                   lld->dma_rx,
+                   (unsigned)lld->dma_rx->CR, (unsigned)lld->dma_rx->NDTR,
+                   (unsigned)lld->dma_rx->M0AR, (unsigned)lld->dma_rx->PAR);
+        rt_kprintf("  TX stream=%p CR=0x%08x NDTR=%u M0AR=0x%08x\n",
+                   lld->dma_tx,
+                   (unsigned)lld->dma_tx->CR, (unsigned)lld->dma_tx->NDTR,
+                   (unsigned)lld->dma_tx->M0AR);
+        rt_kprintf("  DMA2 LISR=0x%08x HISR=0x%08x\n",
+                   (unsigned)DMA2->LISR, (unsigned)DMA2->HISR);
+        rt_kprintf("  rx_isr=0x%08x rx_te_mask=0x%08x rx_all_mask=0x%08x\n",
+                   lld->rx_isr ? (unsigned)*lld->rx_isr : 0u,
+                   (unsigned)lld->rx_te_mask, (unsigned)lld->rx_all_mask);
+        /* Check NVIC state for RX DMA IRQ */
+        {
+            IRQn_Type irq = lld->irq_rx;
+            uint32_t iser_idx = ((uint32_t)irq) >> 5;
+            uint32_t iser_bit = ((uint32_t)irq) & 0x1FU;
+            uint32_t iser_val = NVIC->ISER[iser_idx];
+            uint32_t ispr_val = NVIC->ISPR[iser_idx];
+            rt_kprintf("  NVIC: irq_rx=%d ISER[%u]=0x%08x (bit%u=%u) ISPR[%u]=0x%08x\n",
+                       (int)irq, iser_idx, iser_val, iser_bit,
+                       (iser_val >> iser_bit) & 1u,
+                       iser_idx, ispr_val);
+        }
         LOG_E("spi_lld_xfer: DMA timeout (len=%u)", len);
         _disable_stream_wait(lld->dma_rx);
         _disable_stream_wait(lld->dma_tx);
@@ -242,6 +377,12 @@ rt_err_t spi_lld_xfer(spi_lld_bus_t *lld,
 
     if (lld->error)
     {
+        if (stats != RT_NULL) {
+            stats->dma_error_count++;
+            stats->last_sr = spi->SR;
+            stats->last_cr2 = spi->CR2;
+            stats->last_error = SPI_LLD_DEBUG_ERR_DMA_ERROR;
+        }
         LOG_E("spi_lld_xfer: DMA error");
         return -RT_EIO;
     }
@@ -258,6 +399,12 @@ rt_err_t spi_lld_xfer(spi_lld_bus_t *lld,
     {
         if ((rt_tick_get() - t0) > rt_tick_from_millisecond(5))
         {
+            if (stats != RT_NULL) {
+                stats->bsy_timeout_count++;
+                stats->last_sr = spi->SR;
+                stats->last_cr2 = spi->CR2;
+                stats->last_error = SPI_LLD_DEBUG_ERR_BSY_TIMEOUT;
+            }
             LOG_E("spi_lld_xfer: BSY timeout");
             break;
         }
@@ -276,11 +423,21 @@ rt_err_t spi_lld_xfer(spi_lld_bus_t *lld,
 void spi_lld_dma_rx_irq(spi_lld_bus_t *lld)
 {
     SPI_TypeDef *spi = lld->spi;
+    spi_lld_debug_stats_t *stats = _stats_for_spi(spi);
+
+    if (stats != RT_NULL) {
+        stats->rx_irq_count++;
+        stats->last_sr = spi->SR;
+        stats->last_cr2 = spi->CR2;
+    }
 
     /* Check for DMA transfer error */
     if (*lld->rx_isr & lld->rx_te_mask)
     {
         lld->error = 1;
+        if (stats != RT_NULL) {
+            stats->last_error = SPI_LLD_DEBUG_ERR_DMA_ERROR;
+        }
     }
 
     /* Disable DMA streams (no yield — in ISR) */
@@ -305,6 +462,12 @@ void spi_lld_dma_rx_irq(spi_lld_bus_t *lld)
  */
 void spi_lld_dma_tx_irq(spi_lld_bus_t *lld)
 {
+    spi_lld_debug_stats_t *stats = _stats_for_spi(lld->spi);
+    if (stats != RT_NULL) {
+        stats->tx_irq_count++;
+        stats->last_sr = lld->spi->SR;
+        stats->last_cr2 = lld->spi->CR2;
+    }
     *lld->tx_ifcr = lld->tx_all_mask;
 }
 

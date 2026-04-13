@@ -70,11 +70,11 @@
 #define RT_THREAD_PRIORITY_32
 #define RT_THREAD_PRIORITY_MAX 32
 /*
- * 10 kHz tick matches ChibiOS CH_CFG_ST_FREQUENCY (10000), giving
- * 100 µs scheduling granularity.  rt_thread_mdelay(ms) converts ms
- * to ticks internally, so all mdelay-based waits remain correct.
- * Scheduler::delay_microseconds() now uses rt_thread_delay(ticks)
- * for sub-millisecond precision, critical for 400 Hz main loop.
+ * 10 kHz tick — 100 µs scheduling granularity (aligned with ChibiOS).
+ * At 10 kHz, delay_microseconds(100) → ticks=1 → rt_thread_delay(1),
+ * which gives the CPU to lower-priority threads (logger, IO, storage)
+ * during wait_for_sample() instead of DWT busy-looping.
+ * ISR overhead: ~1.5% at 216 MHz — negligible for a flight controller.
  */
 #define RT_TICK_PER_SECOND 10000
 #define RT_USING_OVERFLOW_CHECK
@@ -131,20 +131,12 @@
 #define RT_USING_USER_MAIN
 #define RT_MAIN_THREAD_STACK_SIZE 32768
 #define RT_MAIN_THREAD_PRIORITY 10
-#define RT_USING_MSH
-#define RT_USING_FINSH
-#define FINSH_USING_MSH
-#define FINSH_THREAD_NAME "tshell"
-#define FINSH_THREAD_PRIORITY 20
-#define FINSH_THREAD_STACK_SIZE 4096
-#define FINSH_USING_HISTORY
-#define FINSH_HISTORY_LINES 5
-#define FINSH_USING_SYMTAB
-#define FINSH_CMD_SIZE 80
-#define MSH_USING_BUILT_IN_COMMANDS
-#define FINSH_USING_DESCRIPTION
-#define FINSH_ARG_MAX 10
-#define FINSH_USING_OPTION_COMPLETION
+/* FinSH/MSH disabled — shell thread shares UART7 with MAVLink and
+ * steals RX bytes + echoes back TX bytes, corrupting binary frames.
+ * Re-enable on a different UART (e.g. USART3) if shell access needed. */
+/* #define RT_USING_MSH */
+/* #define RT_USING_FINSH */
+/* #define FINSH_USING_MSH */
 
 /* DFS: device virtual file system */
 
@@ -159,12 +151,12 @@
 #define RT_USING_DFS_ELMFAT
 #define RT_DFS_ELM_CODE_PAGE 437
 #define RT_DFS_ELM_WORD_ACCESS
-#define RT_DFS_ELM_USE_LFN_3
-#define RT_DFS_ELM_USE_LFN 3
+#define RT_DFS_ELM_USE_LFN_2
+#define RT_DFS_ELM_USE_LFN 2
 #define RT_DFS_ELM_LFN_UNICODE_0
 #define RT_DFS_ELM_LFN_UNICODE 0
 #define RT_DFS_ELM_MAX_LFN 255
-#define RT_DFS_ELM_DRIVES 2
+#define RT_DFS_ELM_DRIVES 1
 #define RT_DFS_ELM_MAX_SECTOR_SIZE 4096
 #define RT_DFS_ELM_REENTRANT
 #define RT_DFS_ELM_MUTEX_TIMEOUT 3000
@@ -177,19 +169,33 @@
 #define RT_USING_SERIAL
 #define RT_USING_SERIAL_V1
 #define RT_SERIAL_USING_DMA
-#define RT_SERIAL_RB_BUFSZ 64
+#define RT_SERIAL_RB_BUFSZ 256
 #define RT_USING_PIN
+/* Software I2C for IST8310 compass on I2C3 (PH7=SCL, PH8=SDA) */
 #define RT_USING_I2C
-/* Software (bit-bang) I2C for IST8310 compass on I2C3 (PH7=SCL, PH8=SDA) */
-/* PH7 = port 7 * 16 + 7 = 119, PH8 = 7 * 16 + 8 = 120 */
 #define RT_USING_I2C_BITOPS
 #define BSP_USING_I2C3
 #define BSP_I2C3_SCL_PIN 119
 #define BSP_I2C3_SDA_PIN 120
 #define RT_USING_SDIO
+#define RT_MMCSD_STACK_SIZE 8192
 #define RT_USING_BLK
 #define RT_USING_SPI
 #define BSP_USING_SPI
+/* PWM output for CUAV V5 servo channels (TIM1/4/12) */
+#define RT_USING_PWM
+#define BSP_USING_PWM
+#define BSP_USING_PWM1
+#define BSP_USING_PWM1_CH1
+#define BSP_USING_PWM1_CH2
+#define BSP_USING_PWM1_CH3
+#define BSP_USING_PWM1_CH4
+#define BSP_USING_PWM4
+#define BSP_USING_PWM4_CH2
+#define BSP_USING_PWM4_CH3
+#define BSP_USING_PWM12
+#define BSP_USING_PWM12_CH1
+#define BSP_USING_PWM12_CH2
 #define BSP_USING_SPI1
 #define BSP_USING_SPI2
 #define BSP_USING_SPI4
@@ -223,10 +229,26 @@
 
 #define BSP_SPI1_RX_USING_DMA
 #define BSP_SPI1_TX_USING_DMA
-#define BSP_SPI2_RX_USING_DMA
-#define BSP_SPI2_TX_USING_DMA
-#define BSP_SPI4_RX_USING_DMA
-#define BSP_SPI4_TX_USING_DMA
+/* SPI2 DMA also disabled for same reason as SPI4. */
+// #define BSP_SPI2_RX_USING_DMA
+// #define BSP_SPI2_TX_USING_DMA
+/* SPI4 DMA — barometer: — DMA completion IRQ not firing, causes baro hang
+ * Polling mode is sufficient for MS5611 @20MHz. */
+
+// #define BSP_SPI4_RX_USING_DMA
+// #define BSP_SPI4_TX_USING_DMA
+
+/* UART7 TX DMA — MAVLink output on UART7 (CH340 GCS port).
+ * DMA1_Stream1/Ch5 is free (only conflicts with BSP_UART3_RX_USING_DMA,
+ * which is not enabled).  Makes TX truly async so the ap_uart thread
+ * doesn't block during transmission, preventing the IO thread starvation
+ * that deadlocks AP_Param::save() during EKF3 init. */
+#define BSP_UART7_TX_USING_DMA
+#define UART7_DMA_TX_IRQHandler           DMA1_Stream1_IRQHandler
+#define UART7_TX_DMA_RCC                  RCC_AHB1ENR_DMA1EN
+#define UART7_TX_DMA_INSTANCE             DMA1_Stream1
+#define UART7_TX_DMA_CHANNEL              DMA_CHANNEL_5
+#define UART7_TX_DMA_IRQ                  DMA1_Stream1_IRQn
 
 /* end of Device Drivers */
 
@@ -499,8 +521,13 @@
 #define BSP_USING_GPIO
 #define BSP_USING_UART
 #define BSP_STM32_UART_V1_TX_TIMEOUT 4000
+#define BSP_USING_UART1
+#define BSP_USING_UART2
 #define BSP_USING_UART3
+#define BSP_USING_UART4
+#define BSP_USING_UART6
 #define BSP_USING_UART7
+#define BSP_USING_UART8
 #define BSP_USING_ON_CHIP_FLASH
 #define BSP_USING_SDIO
 /* end of On-chip Peripheral Drivers */
@@ -520,3 +547,7 @@
 #define USBDEV_REQUEST_BUFFER_LEN 512
 
 #endif
+
+/* Injected from hwdef by rtt.py */
+#define FLASH_ORIGIN 0x08008000
+#define FLASH_LENGTH_KB 1536

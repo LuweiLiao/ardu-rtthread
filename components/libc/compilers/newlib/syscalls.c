@@ -97,12 +97,15 @@ extern void (*__init_array_end[])(void);
 
 volatile int rtt_dbg_ctor_index = -1;
 volatile int rtt_dbg_ctor_total = 0;
+volatile int rtt_dbg_ctor_phase = 0;
 volatile void *rtt_dbg_ctor_addr = 0;
+volatile void *rtt_dbg_ctor_last_returned_addr = 0;
 
 void __libc_init_array(void)
 {
     size_t count, i;
 
+    rtt_dbg_ctor_phase = 1;
     count = (size_t)(__preinit_array_end - __preinit_array_start);
     for (i = 0; i < count; i++)
         __preinit_array_start[i]();
@@ -112,9 +115,13 @@ void __libc_init_array(void)
     for (i = 0; i < count; i++) {
         rtt_dbg_ctor_index = (int)i;
         rtt_dbg_ctor_addr = (void *)__init_array_start[i];
+        rtt_dbg_ctor_phase = 2;
         __init_array_start[i]();
+        rtt_dbg_ctor_last_returned_addr = (void *)__init_array_start[i];
+        rtt_dbg_ctor_phase = 3;
     }
     rtt_dbg_ctor_index = (int)count;
+    rtt_dbg_ctor_phase = 4;
 }
 
 /* Reentrant versions of system calls.  */

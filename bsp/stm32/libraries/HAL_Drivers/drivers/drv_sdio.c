@@ -21,6 +21,9 @@
 #define LOG_TAG             "drv.sdio"
 #include <drv_log.h>
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wshadow"
+
 static struct stm32_sdio_config sdio_config = SDIO_BUS_CONFIG;
 static struct stm32_sdio_class sdio_obj;
 static struct rt_mmcsd_host *host;
@@ -47,7 +50,7 @@ struct rthw_sdio
 };
 
 rt_align(SDIO_ALIGN_LEN)
-static rt_uint8_t cache_buf[SDIO_BUFF_SIZE];
+static rt_uint8_t cache_buf[SDIO_BUFF_SIZE] __attribute__((section(".sram1_bss")));
 
 static rt_uint32_t stm32_sdio_clk_get(struct stm32_sdio *hw_sdio)
 {
@@ -377,20 +380,16 @@ static void rthw_sdio_request(struct rt_mmcsd_host *host, struct rt_mmcsd_req *r
 
             RT_ASSERT(size <= SDIO_BUFF_SIZE);
 
-            pkg.buff = data->buf;
-            if ((rt_uint32_t)data->buf & (SDIO_ALIGN_LEN - 1))
+            pkg.buff = cache_buf;
+            if (data->flags & DATA_DIR_WRITE)
             {
-                pkg.buff = cache_buf;
-                if (data->flags & DATA_DIR_WRITE)
-                {
-                    rt_memcpy(cache_buf, data->buf, size);
-                }
+                rt_memcpy(cache_buf, data->buf, size);
             }
         }
 
         rthw_sdio_send_command(sdio, &pkg);
 
-        if ((data != RT_NULL) && (data->flags & DATA_DIR_READ) && ((rt_uint32_t)data->buf & (SDIO_ALIGN_LEN - 1)))
+        if ((data != RT_NULL) && (data->flags & DATA_DIR_READ))
         {
             rt_memcpy(data->buf, cache_buf, data->blksize * data->blks);
         }
@@ -831,7 +830,7 @@ static rt_err_t DMA_RxConfig(rt_uint32_t *src, rt_uint32_t *dst, int Size)
     return RT_EOK;
 }
 
-void SDIO_IRQHandler(void)
+void SDMMC1_IRQHandler(void)
 {
     /* enter interrupt */
     rt_interrupt_enter();
@@ -884,5 +883,7 @@ void stm32_mmcsd_change(void)
 {
     mmcsd_change(host);
 }
+
+#pragma GCC diagnostic pop
 
 #endif

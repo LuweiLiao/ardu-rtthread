@@ -171,6 +171,8 @@ static rt_ssize_t usbd_serial_read(struct rt_device *dev,
     return rt_ringbuffer_get(&serial->rx_rb, (rt_uint8_t *)buffer, size);
 }
 
+static volatile uint32_t dbg_serial_unstick_cnt = 0;
+
 static rt_ssize_t usbd_serial_write(struct rt_device *dev,
                                     rt_off_t pos,
                                     const void *buffer,
@@ -190,15 +192,31 @@ static rt_ssize_t usbd_serial_write(struct rt_device *dev,
         return -RT_EPERM;
     }
 
+    /*
+     * Self-heal stuck tx_active: if tx_active has been 1 for many
+     * consecutive write calls that ALSO fail to enqueue (tx_rb full),
+     * the IN endpoint is stuck.  Only count failed enqueues — successful
+     * writes prove the TX chain is making progress even while tx_active
+     * remains 1 (normal during sustained traffic with multiple drain calls).
+     */
+    static uint32_t tx_stuck_counter = 0;
+
     rt_size_t written = rt_ringbuffer_put(&serial->tx_rb, (const rt_uint8_t *)buffer, size);
 
     if (written > 0) {
         dbg_serial_write_ok++;
+        tx_stuck_counter = 0;
         if (!serial->tx_active) {
             usbd_serial_kick_tx(serial);
         }
     } else {
         dbg_serial_write_timeout++;
+        if (serial->tx_active && ++tx_stuck_counter > 100) {
+            usbd_ep_recover_stuck(serial->busid, serial->in_ep);
+            serial->tx_active = 0;
+            tx_stuck_counter = 0;
+            dbg_serial_unstick_cnt++;
+        }
     }
 
     return written;

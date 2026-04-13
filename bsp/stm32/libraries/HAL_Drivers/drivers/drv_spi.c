@@ -293,7 +293,12 @@ static rt_ssize_t spixfer(struct rt_spi_device *device, struct rt_spi_message *m
      * Keep DMA threshold conservative to avoid setup-stage stalls while still
      * reducing polling overhead on medium/large transfers.
      */
-    #define DMA_TRANS_MIN_LEN  16
+    /*
+     * STM32F7 short polling transfers can wedge inside the HAL SPI
+     * transmit/receive loops. Prefer DMA for all transfer sizes so we
+     * stay on the LLD/HAL-DMA paths instead of falling back to polling.
+     */
+    #define DMA_TRANS_MIN_LEN  1
 
     HAL_StatusTypeDef state = HAL_OK;
     rt_size_t message_length, already_send_length;
@@ -1057,12 +1062,17 @@ void SPI4_IRQHandler(void)
   */
 void SPI4_DMA_RX_IRQHandler(void)
 {
-    /* enter interrupt */
     rt_interrupt_enter();
-
-    HAL_DMA_IRQHandler(&spi_bus_obj[SPI4_INDEX].dma.handle_rx);
-
-    /* leave interrupt */
+#if defined(SOC_SERIES_STM32F7)
+    if (spi_bus_obj[SPI4_INDEX].lld != RT_NULL)
+    {
+        spi_lld_dma_rx_irq(spi_bus_obj[SPI4_INDEX].lld);
+    }
+    else
+#endif
+    {
+        HAL_DMA_IRQHandler(&spi_bus_obj[SPI4_INDEX].dma.handle_rx);
+    }
     rt_interrupt_leave();
 }
 #endif
@@ -1075,12 +1085,17 @@ void SPI4_DMA_RX_IRQHandler(void)
   */
 void SPI4_DMA_TX_IRQHandler(void)
 {
-    /* enter interrupt */
     rt_interrupt_enter();
-
-    HAL_DMA_IRQHandler(&spi_bus_obj[SPI4_INDEX].dma.handle_tx);
-
-    /* leave interrupt */
+#if defined(SOC_SERIES_STM32F7)
+    if (spi_bus_obj[SPI4_INDEX].lld != RT_NULL)
+    {
+        spi_lld_dma_tx_irq(spi_bus_obj[SPI4_INDEX].lld);
+    }
+    else
+#endif
+    {
+        HAL_DMA_IRQHandler(&spi_bus_obj[SPI4_INDEX].dma.handle_tx);
+    }
     rt_interrupt_leave();
 }
 #endif /* defined(BSP_USING_SPI4) && defined(BSP_SPI_USING_DMA) */

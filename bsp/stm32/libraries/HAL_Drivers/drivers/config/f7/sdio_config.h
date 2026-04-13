@@ -19,6 +19,9 @@ extern "C" {
 #endif
 
 #ifdef BSP_USING_SDIO
+/* CUAV V5 uses SDMMC1 (PC8-12/PD2), not SDMMC2.
+ * SDMMC1 DMA: DMA2_Stream3/Channel_4 (RX), DMA2_Stream6/Channel_4 (TX).
+ * Note: DMA2_Stream0 is used by SPI4-RX, DMA2_Stream5 by SPI1-TX. */
 #define SDIO_BUS_CONFIG                                  \
     {                                                    \
         .Instance = SDMMC1,                              \

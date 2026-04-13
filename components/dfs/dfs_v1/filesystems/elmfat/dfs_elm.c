@@ -364,7 +364,15 @@ int dfs_elm_open(struct dfs_file *file)
 
     rt_snprintf(drivers_fn, 256, "%d:%s", vol, file->vnode->path);
 #else
-    drivers_fn = file->vnode->path;
+    /*
+     * Single logical volume: still pass "0:<path>" to FatFs. Using vnode->path
+     * alone (e.g. "/foo.txt") can yield FR_INVALID_NAME on some builds while
+     * f_stat() on the same subpath succeeds — align with the multi-volume branch.
+     */
+    drivers_fn = (char *)rt_malloc(256);
+    if (drivers_fn == RT_NULL)
+        return -ENOMEM;
+    rt_snprintf(drivers_fn, 256, "0:%s", file->vnode->path);
 #endif
 
     if (file->flags & O_DIRECTORY)
@@ -376,9 +384,7 @@ int dfs_elm_open(struct dfs_file *file)
             result = f_mkdir(drivers_fn);
             if (result != FR_OK)
             {
-#if FF_VOLUMES > 1
                 rt_free(drivers_fn);
-#endif
                 return elm_result_to_dfs(result);
             }
         }
@@ -387,16 +393,12 @@ int dfs_elm_open(struct dfs_file *file)
         dir = (DIR *)rt_malloc(sizeof(DIR));
         if (dir == RT_NULL)
         {
-#if FF_VOLUMES > 1
             rt_free(drivers_fn);
-#endif
             return -ENOMEM;
         }
 
         result = f_opendir(dir, drivers_fn);
-#if FF_VOLUMES > 1
         rt_free(drivers_fn);
-#endif
         if (result != FR_OK)
         {
             rt_free(dir);
@@ -428,16 +430,12 @@ int dfs_elm_open(struct dfs_file *file)
         fd = (FIL *)rt_malloc(sizeof(FIL));
         if (fd == RT_NULL)
         {
-#if FF_VOLUMES > 1
             rt_free(drivers_fn);
-#endif
             return -ENOMEM;
         }
 
         result = f_open(fd, drivers_fn, mode);
-#if FF_VOLUMES > 1
         rt_free(drivers_fn);
-#endif
         if (result == FR_OK)
         {
             file->pos  = fd->fptr;
@@ -691,65 +689,73 @@ int dfs_elm_getdents(struct dfs_file *file, struct dirent *dirp, uint32_t count)
 int dfs_elm_unlink(struct dfs_filesystem *fs, const char *path)
 {
     FRESULT result;
+    char *drivers_fn;
 
 #if FF_VOLUMES > 1
     int vol;
-    char *drivers_fn;
     extern int elm_get_vol(FATFS * fat);
 
-    /* add path for ELM FatFS driver support */
     vol = elm_get_vol((FATFS *)fs->data);
     if (vol < 0)
         return -ENOENT;
     drivers_fn = (char *)rt_malloc(256);
     if (drivers_fn == RT_NULL)
         return -ENOMEM;
-
     rt_snprintf(drivers_fn, 256, "%d:%s", vol, path);
 #else
-    const char *drivers_fn;
-    drivers_fn = path;
+    drivers_fn = (char *)rt_malloc(256);
+    if (drivers_fn == RT_NULL)
+        return -ENOMEM;
+    rt_snprintf(drivers_fn, 256, "0:%s", path);
 #endif
 
     result = f_unlink(drivers_fn);
-#if FF_VOLUMES > 1
     rt_free(drivers_fn);
-#endif
     return elm_result_to_dfs(result);
 }
 
 int dfs_elm_rename(struct dfs_filesystem *fs, const char *oldpath, const char *newpath)
 {
     FRESULT result;
+    char *oldbuf = RT_NULL;
+    char *newbuf = RT_NULL;
+    const TCHAR *arg_old;
+    const TCHAR *arg_new;
 
-#if FF_VOLUMES > 1
-    char *drivers_oldfn;
-    const char *drivers_newfn;
+#if (FF_VOLUMES > 1)
     int vol;
     extern int elm_get_vol(FATFS * fat);
 
-    /* add path for ELM FatFS driver support */
     vol = elm_get_vol((FATFS *)fs->data);
     if (vol < 0)
         return -ENOENT;
 
-    drivers_oldfn = (char *)rt_malloc(256);
-    if (drivers_oldfn == RT_NULL)
+    oldbuf = (char *)rt_malloc(256);
+    if (oldbuf == RT_NULL)
         return -ENOMEM;
-    drivers_newfn = newpath;
-
-    rt_snprintf(drivers_oldfn, 256, "%d:%s", vol, oldpath);
+    rt_snprintf(oldbuf, 256, "%d:%s", vol, oldpath);
+    arg_old = (const TCHAR *)oldbuf;
+    arg_new = (const TCHAR *)newpath;
 #else
-    const char *drivers_oldfn, *drivers_newfn;
-
-    drivers_oldfn = oldpath;
-    drivers_newfn = newpath;
+    oldbuf = (char *)rt_malloc(256);
+    newbuf = (char *)rt_malloc(256);
+    if (oldbuf == RT_NULL || newbuf == RT_NULL)
+    {
+        if (oldbuf) rt_free(oldbuf);
+        if (newbuf) rt_free(newbuf);
+        return -ENOMEM;
+    }
+    rt_snprintf(oldbuf, 256, "0:%s", oldpath);
+    rt_snprintf(newbuf, 256, "0:%s", newpath);
+    arg_old = (const TCHAR *)oldbuf;
+    arg_new = (const TCHAR *)newbuf;
 #endif
 
-    result = f_rename(drivers_oldfn, drivers_newfn);
-#if FF_VOLUMES > 1
-    rt_free(drivers_oldfn);
-#endif
+    result = f_rename(arg_old, arg_new);
+    if (oldbuf)
+        rt_free(oldbuf);
+    if (newbuf)
+        rt_free(newbuf);
     return elm_result_to_dfs(result);
 }
 
@@ -763,9 +769,11 @@ int dfs_elm_stat(struct dfs_filesystem *fs, const char *path, struct stat *st)
 
 #if FF_VOLUMES > 1
     int vol;
-    char *drivers_fn;
     extern int elm_get_vol(FATFS * fat);
+#endif
+    char *drivers_fn;
 
+#if FF_VOLUMES > 1
     /* add path for ELM FatFS driver support */
     vol = elm_get_vol((FATFS *)fs->data);
     if (vol < 0)
@@ -776,14 +784,14 @@ int dfs_elm_stat(struct dfs_filesystem *fs, const char *path, struct stat *st)
 
     rt_snprintf(drivers_fn, 256, "%d:%s", vol, path);
 #else
-    const char *drivers_fn;
-    drivers_fn = path;
+    drivers_fn = (char *)rt_malloc(256);
+    if (drivers_fn == RT_NULL)
+        return -ENOMEM;
+    rt_snprintf(drivers_fn, 256, "0:%s", path);
 #endif
 
     result = f_stat(drivers_fn, &file_info);
-#if FF_VOLUMES > 1
     rt_free(drivers_fn);
-#endif
     if (result == FR_OK)
     {
         /* convert to dfs stat structure */

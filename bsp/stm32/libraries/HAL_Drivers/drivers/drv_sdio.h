@@ -27,14 +27,16 @@
 #if defined(SOC_SERIES_STM32F1) || defined(SOC_SERIES_STM32F2) || defined(SOC_SERIES_STM32F4)
 #define SDCARD_INSTANCE                   SDIO
 #elif defined(SOC_SERIES_STM32L4) || defined(SOC_SERIES_STM32F7)
+#ifndef SDCARD_INSTANCE
 #define SDCARD_INSTANCE                   SDMMC1
+#endif
 #endif /*  defined(SOC_SERIES_STM32F1) || defined(SOC_SERIES_STM32F4) */
 
 #define SDIO_BUFF_SIZE       4096
 #define SDIO_ALIGN_LEN       32
 
 #ifndef SDIO_BASE_ADDRESS
-#define SDIO_BASE_ADDRESS    (0x40012800U)
+#define SDIO_BASE_ADDRESS    SDMMC1_BASE
 #endif
 
 #ifndef SDIO_CLOCK_FREQ

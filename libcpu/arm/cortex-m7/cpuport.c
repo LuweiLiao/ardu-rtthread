@@ -46,6 +46,7 @@ volatile rt_uint32_t rtt_dbg_pendsv_exit_stack_xpsr;
 volatile rt_uint32_t rtt_dbg_hardfault_lr;
 volatile rt_uint32_t rtt_dbg_hardfault_msp;
 volatile rt_uint32_t rtt_dbg_hardfault_psp;
+volatile rt_uint32_t rtt_dbg_hardfault_frame_sp;
 volatile rt_uint32_t rtt_dbg_hardfault_stack_lr;
 volatile rt_uint32_t rtt_dbg_hardfault_stack_pc;
 volatile rt_uint32_t rtt_dbg_hardfault_stack_xpsr;
@@ -167,6 +168,11 @@ rt_uint8_t *rt_hw_stack_init(void       *tentry,
     stk  = stack_addr + sizeof(rt_uint32_t);
     stk  = (rt_uint8_t *)RT_ALIGN_DOWN((rt_uint32_t)stk, 8);
     stk -= sizeof(struct stack_frame);
+    /* Ensure stk is 8-byte aligned: when USE_FPU=1, stack_frame is 68 bytes
+     * (not a multiple of 8), so after subtraction the result may be only
+     * 4-byte aligned.  Cortex-M7 with FPU requires 8-byte aligned PSP for
+     * exception return (INVPC otherwise). */
+    stk  = (rt_uint8_t *)RT_ALIGN_DOWN((rt_uint32_t)stk, 8);
 
     stack_frame = (struct stack_frame *)stk;
 

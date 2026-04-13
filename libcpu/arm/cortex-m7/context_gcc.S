@@ -272,6 +272,12 @@ HardFault_Handler:
     MRS     r1, psp
     LDR     r0, =rtt_dbg_hardfault_psp
     STR     r1, [r0]
+    MRS     r1, msp                 /* default to handler stack frame */
+    TST     lr, #0x04               /* if(EXC_RETURN[2]) use PSP */
+    IT      NE
+    MRSNE   r1, psp
+    LDR     r0, =rtt_dbg_hardfault_frame_sp
+    STR     r1, [r0]
     TST     lr, #0x10
     BEQ     hardfault_ext_frame
 
@@ -287,7 +293,7 @@ HardFault_Handler:
     LDR     r0, =rtt_dbg_hardfault_frame_ext
     MOV     r3, #0
     STR     r3, [r0]
-    B       hardfault_frame_done
+    B       hardfault_hang
 
 hardfault_ext_frame:
     LDR     r3, [r1, #0x5c]          /* ext frame: stacked LR */
@@ -303,42 +309,7 @@ hardfault_ext_frame:
     MOV     r3, #1
     STR     r3, [r0]
 
-hardfault_frame_done:
-
-    /* get current context */
-    MRS     r0, msp                 /* get fault context from handler. */
-    TST     lr, #0x04               /* if(!EXC_RETURN[2]) */
-    BEQ     _get_sp_done
-    MRS     r0, psp                 /* get fault context from thread. */
-_get_sp_done:
-#if defined (__VFP_FP__) && !defined(__SOFTFP__)
-    TST     lr, #0x10               /* if(!EXC_RETURN[4]) */
-    IT      EQ
-    VSTMDBEQ r0!, {d8 - d15}        /* push FPU register s16~s31 */
-#endif
-
-    STMFD   r0!, {r4 - r11}         /* push r4 - r11 register */
-
-#if defined (__VFP_FP__) && !defined(__SOFTFP__)
-    MOV     r4, #0x00
-    TST     lr, #0x10               /* if(!EXC_RETURN[4]) */
-    IT      EQ
-    MOVEQ   r4, #0x01               /* flag = 1 */
-    STMFD   r0!, {r4}               /* push flag */
-#endif
-    STMFD   r0!, {lr}               /* push exec_return register */
-
-    TST     lr, #0x04               /* if(!EXC_RETURN[2]) */
-    BEQ     _update_msp
-    MSR     psp, r0                 /* update stack pointer to PSP. */
-    B       _update_done
-_update_msp:
-    MSR     msp, r0                 /* update stack pointer to MSP. */
-_update_done:
-
-    PUSH    {LR}
-    BL      rt_hw_hard_fault_exception
-    POP     {LR}
-
-    ORR     lr, lr, #0x04
-    BX      lr
+hardfault_hang:
+    CPSID   I
+1:
+    B       1b
