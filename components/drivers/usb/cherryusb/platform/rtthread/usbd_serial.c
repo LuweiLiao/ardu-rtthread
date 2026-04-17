@@ -20,7 +20,7 @@
 #endif
 
 #ifndef CONFIG_USBDEV_SERIAL_TX_BUFSIZE
-#define CONFIG_USBDEV_SERIAL_TX_BUFSIZE (2048)
+#define CONFIG_USBDEV_SERIAL_TX_BUFSIZE (4096)
 #endif
 
 struct usbd_serial {
@@ -206,23 +206,17 @@ static rt_ssize_t usbd_serial_write(struct rt_device *dev,
     if (written > 0) {
         dbg_serial_write_ok++;
         tx_stuck_counter = 0;
-        /*
-         * Critical section: prevent XFRC ISR from racing with kick_tx.
-         * The bulk_in ISR (usbd_cdc_acm_bulk_in → kick_tx) and this
-         * thread can both call kick_tx simultaneously if tx_active is
-         * checked without protection. Both then call usbd_ep_start_write
-         * causing EPENA collision → stuck endpoint (no XFRC fires).
-         * Save/restore PRIMASK to handle nesting with DWC2 driver's
-         * own __disable_irq() calls.
-         */
+        /* Check tx_active under PRIMASK, then kick outside critical section
+         * to avoid holding IRQs while calling into DWC2 driver. */
+        bool should_kick;
         {
-            volatile uint32_t primask;
-            __asm volatile("mrs %0, primask" : "=r"(primask));
+            uint32_t primask; __asm volatile("mrs %0, primask" : "=r"(primask));
             __asm volatile("cpsid i" ::: "memory");
-            if (!serial->tx_active) {
-                usbd_serial_kick_tx(serial);
-            }
+            should_kick = !serial->tx_active;
             __asm volatile("msr primask, %0" :: "r"(primask) : "memory");
+        }
+        if (should_kick) {
+            usbd_serial_kick_tx(serial);
         }
     } else {
         dbg_serial_write_timeout++;
