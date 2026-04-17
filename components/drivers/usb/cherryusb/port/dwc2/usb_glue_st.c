@@ -643,6 +643,27 @@ void usb_dc_low_level_init(uint8_t busid)
     g_dwc2_instance.Instance = (USB_OTG_GlobalTypeDef *)g_usbdev_bus[busid].reg_base;
     HAL_PCD_MspInit((PCD_HandleTypeDef *)&g_dwc2_instance);
 
+    /*
+     * Hot-reset fix: force-reset USB OTG peripheral via RCC to clear
+     * stuck DWC2 AHB bus (AHBIDL=0 after warm reset).
+     */
+    __HAL_RCC_USB_OTG_FS_FORCE_RESET();
+    {
+        volatile uint32_t _dly = 10000;
+        while (_dly--) __NOP();
+    }
+    __HAL_RCC_USB_OTG_FS_RELEASE_RESET();
+    __HAL_RCC_USB_OTG_FS_CLK_ENABLE();  /* force-reset clears EN bit */
+
+    /* Wait for DWC2 AHB master idle after reset */
+    {
+        volatile uint32_t _tick = 500000U;
+        while (_tick-- > 0U) {
+            if (g_dwc2_instance.Instance->GRSTCTL & USB_OTG_GRSTCTL_AHBIDL)
+                break;
+        }
+    }
+
 #if defined(STM32F722xx) || defined(STM32F723xx) || defined(STM32F730xx) || defined(STM32F732xx) || defined(STM32F733xx)
     usb_hsphy_init(25000000U);
 #endif

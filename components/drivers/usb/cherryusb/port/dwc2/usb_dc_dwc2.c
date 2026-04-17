@@ -2,7 +2,16 @@
  * Copyright (c) 2022, sakumisu
  *
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * CUAV v5 hot-reset fix: Disable USB_ASSERT_MSG to prevent while(1) dead loops
+ * when DWC2 is in an unexpected state after software reset. The proper recovery
+ * is handled in cherryusb.c (cdc_acm_dwc2_unlock). If it fails, we want the
+ * init to continue rather than permanently hanging.
  */
+#ifndef CONFIG_USB_ASSERT_DISABLE
+#define CONFIG_USB_ASSERT_DISABLE
+#endif
+
 #include "usbd_core.h"
 #include "usb_dwc2_reg.h"
 #include "usb_dwc2_param.h"
@@ -41,6 +50,14 @@ static inline void __local_DSB(void)
 #define __DSB __local_DSB
 #endif
 
+#ifndef __ISB
+static inline void __local_ISB(void)
+{
+    __asm volatile("isb 0xF" ::: "memory");
+}
+#define __ISB __local_ISB
+#endif
+
 #define USBD_BASE (g_usbdev_bus[busid].reg_base)
 
 #define USB_OTG_GLB      ((DWC2_GlobalTypeDef *)(USBD_BASE))
@@ -70,13 +87,28 @@ USB_NOCACHE_RAM_SECTION struct dwc2_udc {
     struct dwc2_ep_state out_ep[16]; /*!< OUT endpoint parameters */
 } g_dwc2_udc[CONFIG_USBDEV_MAX_BUS];
 
+/*
+ * DWC2 core soft reset.
+ *
+ * On CUAV v5 (STM32F7, FS PHY) GSNPSID = 0x4F54420A so we use the
+ * CSRSTDONE (bit17) completion path.  When GSNPSID reads as garbage
+ * (USB clock not yet enabled at hw_params read time), we still use
+ * CSRSTDONE to avoid deadlock on the self-clear path.
+ *
+ * Hot-reset recovery is handled in cherryusb.c before usb_dc_init()
+ * is called (RCC clock power cycle).  By the time we reach here,
+ * HAL_PCD_MspInit has enabled the USB clock and the DWC2 should be
+ * in a clean state.
+ */
 static inline int dwc2_reset(uint8_t busid)
 {
     volatile uint32_t count = 0U;
 
     /* Wait for AHB master IDLE state. */
+    count = 0U;
     do {
-        if (++count > 200000U) {
+        if (++count > 5000000U) { /* ~25 ms */
+            USB_LOG_ERR("DWC2 AHBIDL timeout\r\n");
             return -1;
         }
     } while ((USB_OTG_GLB->GRSTCTL & USB_OTG_GRSTCTL_AHBIDL) == 0U);
@@ -85,17 +117,31 @@ static inline int dwc2_reset(uint8_t busid)
     count = 0U;
     USB_OTG_GLB->GRSTCTL |= USB_OTG_GRSTCTL_CSRST;
 
-    if (g_dwc2_udc[busid].hw_params.snpsid < 0x4F54420AU) {
+    /*
+     * CSRST completion: always use CSRSTDONE (bit17) path.
+     * GSNPSID may read as 0 or garbage if USB clock was not enabled
+     * when dwc2_get_hwparams() ran (before HAL_PCD_MspInit).
+     * CSRSTDONE is the correct path for STM32F7 FS PHY regardless.
+     */
+    if (g_dwc2_udc[busid].hw_params.snpsid >= 0x4F54420AU) {
         do {
-            if (++count > 200000U) {
-                USB_LOG_ERR("DWC2 reset timeout\r\n");
+            if (++count > 5000000U) { /* ~25 ms */
+                USB_LOG_ERR("DWC2 CSRSTDONE timeout\r\n");
+                USB_OTG_PCGCCTL = 0U;
                 return -1;
             }
-        } while ((USB_OTG_GLB->GRSTCTL & USB_OTG_GRSTCTL_CSRST) == USB_OTG_GRSTCTL_CSRST);
+        } while ((USB_OTG_GLB->GRSTCTL & USB_OTG_GRSTCTL_CSRSTDONE) != USB_OTG_GRSTCTL_CSRSTDONE);
+
+        USB_OTG_GLB->GRSTCTL &= ~USB_OTG_GRSTCTL_CSRST;
+        USB_OTG_GLB->GRSTCTL |= USB_OTG_GRSTCTL_CSRSTDONE;
     } else {
+        /* GSNPSID unreliable — use CSRSTDONE path anyway */
+        USB_LOG_WRN("DWC2 GSNPSID=0x%08lX, using CSRSTDONE path\r\n",
+                    (unsigned long)g_dwc2_udc[busid].hw_params.snpsid);
         do {
-            if (++count > 200000U) {
-                USB_LOG_ERR("DWC2 reset timeout\r\n");
+            if (++count > 5000000U) { /* ~25 ms */
+                USB_LOG_ERR("DWC2 CSRSTDONE timeout (fallback)\r\n");
+                USB_OTG_PCGCCTL = 0U;
                 return -1;
             }
         } while ((USB_OTG_GLB->GRSTCTL & USB_OTG_GRSTCTL_CSRSTDONE) != USB_OTG_GRSTCTL_CSRSTDONE);
@@ -103,6 +149,10 @@ static inline int dwc2_reset(uint8_t busid)
         USB_OTG_GLB->GRSTCTL &= ~USB_OTG_GRSTCTL_CSRST;
         USB_OTG_GLB->GRSTCTL |= USB_OTG_GRSTCTL_CSRSTDONE;
     }
+
+    /* Re-enable PHY clock after successful core reset */
+    USB_OTG_PCGCCTL = 0U;
+    __DSB();
 
     return 0;
 }
@@ -149,7 +199,7 @@ static inline int dwc2_core_init(uint8_t busid)
     return ret;
 }
 
-static inline void dwc2_set_mode(uint8_t busid, uint8_t mode)
+static inline int dwc2_set_mode(uint8_t busid, uint8_t mode)
 {
     USB_OTG_GLB->GUSBCFG &= ~(USB_OTG_GUSBCFG_FHMOD | USB_OTG_GUSBCFG_FDMOD);
 
@@ -159,12 +209,18 @@ static inline void dwc2_set_mode(uint8_t busid, uint8_t mode)
         USB_OTG_GLB->GUSBCFG |= USB_OTG_GUSBCFG_FDMOD;
     }
 
+    volatile uint32_t count = 0U;
     while (1) {
         if ((USB_OTG_GLB->GINTSTS & 0x1U) == USB_OTG_MODE_DEVICE) {
             break;
         }
         usbd_dwc2_delay_ms(10);
+        if (++count > 100U) { /* 1 s timeout */
+            USB_LOG_ERR("dwc2_set_mode timeout\r\n");
+            return -1;
+        }
     }
+    return 0;
 }
 
 static inline int dwc2_flush_rxfifo(uint8_t busid)
@@ -558,10 +614,21 @@ int usb_dc_init(uint8_t busid)
 
     USB_OTG_DEV->DCTL |= USB_OTG_DCTL_SDIS;
 
+    /*
+     * CRITICAL: wait 50 ms after soft-disconnect so the USB host detects the
+     * disconnect (D+ pull-down) and stops sending packets.  Without this delay,
+     * the PHY continues to receive data, the AHB bus stays busy, and
+     * dwc2_reset() CSRST can never complete — permanently bricking DWC2.
+     */
+    usbd_dwc2_delay_ms(50);
+
     /* This is vendor register */
     USB_OTG_GLB->GCCFG = g_dwc2_udc[busid].user_params.device_gccfg;
 
     ret = dwc2_core_init(busid);
+    if (ret != 0) {
+        USB_LOG_ERR("dwc2_core_init failed (%d), continuing anyway\r\n", ret);
+    }
 
     /* Force Device Mode*/
     dwc2_set_mode(busid, USB_OTG_MODE_DEVICE);
