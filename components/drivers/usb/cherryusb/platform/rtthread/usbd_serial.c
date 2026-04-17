@@ -8,7 +8,7 @@
 
 #include "usbd_core.h"
 #include "usbd_cdc_acm.h"
-#include "usb_dc_dwc2.h"
+#include "../port/dwc2/usb_dc_dwc2.h"
 
 #define DEV_FORMAT_CDC_ACM "usb-acm%d"
 
@@ -275,7 +275,7 @@ static void usbd_serial_kick_tx(struct usbd_serial *serial)
      */
     {
         uint8_t ep_idx = serial->in_ep & 0x7F;
-        if (ep_idx && (USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)) {
+        if (ep_idx && (DWC2_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)) {
             serial->tx_active = 0;
             return;
         }
