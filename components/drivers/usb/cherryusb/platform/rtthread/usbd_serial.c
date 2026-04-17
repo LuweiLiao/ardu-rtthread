@@ -8,6 +8,7 @@
 
 #include "usbd_core.h"
 #include "usbd_cdc_acm.h"
+#include "usb_dc_dwc2.h"
 
 #define DEV_FORMAT_CDC_ACM "usb-acm%d"
 
@@ -33,6 +34,7 @@ struct usbd_serial {
     usb_osal_sem_t tx_done;
     uint8_t minor;
     volatile uint8_t tx_active;
+    volatile uint8_t tx_need_kick;  /* ISR sets this; thread clears in write() */
     char name[32];
     struct rt_ringbuffer rx_rb;
     rt_uint8_t rx_rb_buffer[CONFIG_USBDEV_SERIAL_RX_BUFSIZE];
@@ -68,6 +70,7 @@ void usbd_serial_reset_tx(void)
     for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
         struct usbd_serial *serial = &g_usbd_serial_cdc_acm[devno];
         serial->tx_active = 0;
+        serial->tx_need_kick = 0;
         rt_ringbuffer_reset(&serial->tx_rb);
         if (serial->in_ep) {
             usbd_ep_recover_stuck(serial->busid, serial->in_ep);
@@ -206,8 +209,12 @@ static rt_ssize_t usbd_serial_write(struct rt_device *dev,
     if (written > 0) {
         dbg_serial_write_ok++;
         tx_stuck_counter = 0;
-        /* kick_tx has its own atomic tx_active guard — safe to call
-         * unconditionally from thread context. */
+        /* Check if ISR flagged a pending kick (XFRC completed while
+         * we weren't in write). Clear flag and kick regardless of
+         * tx_active state — kick_tx has its own guard. */
+        if (serial->tx_need_kick) {
+            serial->tx_need_kick = 0;
+        }
         usbd_serial_kick_tx(serial);
     } else {
         dbg_serial_write_timeout++;
@@ -256,6 +263,22 @@ static void usbd_serial_kick_tx(struct usbd_serial *serial)
     if (avail == 0) {
         serial->tx_active = 0;
         return;
+    }
+
+    /*
+     * Pre-flight EPENA check: if the IN endpoint is still enabled from a
+     * previous transfer, do NOT consume data from the ringbuffer — just
+     * release tx_active and return.  The XFRC ISR (or a retry from write())
+     * will call kick_tx again after the endpoint clears.
+     * This prevents data loss when usbd_ep_start_write would hit the
+     * EPENA=1 error path (now a non-blocking return -3).
+     */
+    {
+        uint8_t ep_idx = serial->in_ep & 0x7F;
+        if (ep_idx && (USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)) {
+            serial->tx_active = 0;
+            return;
+        }
     }
 
     uint16_t to_send = (avail > mps) ? mps : (uint16_t)avail;
@@ -361,12 +384,9 @@ void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
              */
             /* Clear tx_active and re-arm the next transfer.
              * After XFRC the hardware cleared EPENA, so kick_tx's
-             * usbd_ep_start_write will NOT enter the EPENA flush
-             * path (the deadly 200K nop dwc2_flush_txfifo).
-             * kick_tx now keeps PRIMASK=1 through the entire
-             * usbd_ep_start_write call, so even in ISR context
-             * (where PRIMASK is already 1) the race window between
-             * tx_active check and EPENA set is closed. */
+             * pre-flight EPENA check will pass and usbd_ep_start_write
+             * will NOT enter the EPENA=1 path (which is now a simple
+             * return -3 with no blocking). */
             serial->tx_active = 0;
             usbd_serial_kick_tx(serial);
             return;
@@ -436,6 +456,7 @@ void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
                 usbd_ep_recover_stuck(serial->busid, serial->in_ep);
             }
             serial->tx_active = 0;
+            serial->tx_need_kick = 1;
             rt_ringbuffer_reset(&serial->tx_rb);
             if (serial->out_ep) {
                 dbg_serial_rx_rearm++;
@@ -453,6 +474,7 @@ void usbd_cdc_acm_set_dtr(uint8_t busid, uint8_t intf, bool dtr)
                 usbd_ep_recover_stuck(serial->busid, serial->in_ep);
             }
             serial->tx_active = 0;
+            serial->tx_need_kick = 1;
             rt_ringbuffer_reset(&serial->tx_rb);
         }
     }

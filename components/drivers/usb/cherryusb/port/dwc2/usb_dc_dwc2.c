@@ -1050,26 +1050,14 @@ int usbd_ep_start_write(uint8_t busid, const uint8_t ep, const uint8_t *data, ui
     }
 
     /*
-     * If EP is already enabled (previous transfer still in progress), disable it first.
-     * Re-setting EPENA while EP is enabled causes undefined DWC2 behavior:
-     * the endpoint may never complete (no XFRC), causing tx_active to stick forever.
-     * This was the root cause of 81% USB CDC TX write failures.
+     * EPENA=1 guard: if the IN endpoint is still enabled from a previous
+     * transfer, return -3 immediately — do NOT block with SNAK/EPDIS/wait.
+     * The caller (kick_tx) has a pre-flight EPENA check, so this path
+     * should rarely trigger.  When it does, kick_tx will release tx_active
+     * and retry on the next XFRC ISR or write() call.
      */
     if (ep_idx && (USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)) {
-        USB_OTG_INEP(ep_idx)->DIEPCTL |= (USB_OTG_DIEPCTL_SNAK | USB_OTG_DIEPCTL_EPDIS);
-        volatile uint32_t cnt = 0;
-        while ((USB_OTG_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA) && (++cnt < 10000U)) {
-            __asm volatile("nop");
-        }
-        USB_OTG_INEP(ep_idx)->DIEPINT = 0xFF;
-        {
-            uint32_t primask = __get_PRIMASK();
-            __disable_irq();
-            USB_OTG_DEV->DIEPEMPMSK &= ~(1UL << ep_idx);
-            __set_PRIMASK(primask);
-        }
-        dwc2_flush_txfifo(busid, ep_idx);
-        USB_OTG_INEP(ep_idx)->DIEPCTL |= USB_OTG_DIEPCTL_SD0PID_SEVNFRM;
+        return -3;
     }
 
     g_dwc2_udc[busid].in_ep[ep_idx].xfer_buf = (uint8_t *)data;
