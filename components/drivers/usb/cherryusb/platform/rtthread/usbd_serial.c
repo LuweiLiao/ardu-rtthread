@@ -206,18 +206,9 @@ static rt_ssize_t usbd_serial_write(struct rt_device *dev,
     if (written > 0) {
         dbg_serial_write_ok++;
         tx_stuck_counter = 0;
-        /* Check tx_active under PRIMASK, then kick outside critical section
-         * to avoid holding IRQs while calling into DWC2 driver. */
-        bool should_kick;
-        {
-            uint32_t primask; __asm volatile("mrs %0, primask" : "=r"(primask));
-            __asm volatile("cpsid i" ::: "memory");
-            should_kick = !serial->tx_active;
-            __asm volatile("msr primask, %0" :: "r"(primask) : "memory");
-        }
-        if (should_kick) {
-            usbd_serial_kick_tx(serial);
-        }
+        /* kick_tx has its own atomic tx_active guard — safe to call
+         * unconditionally from thread context. */
+        usbd_serial_kick_tx(serial);
     } else {
         dbg_serial_write_timeout++;
         if (serial->tx_active && ++tx_stuck_counter > 100) {
@@ -239,6 +230,25 @@ static void usbd_serial_kick_tx(struct usbd_serial *serial)
         return;
     }
 
+    /*
+     * Atomic tx_active guard: only one caller (ISR or thread) may
+     * proceed to submit a USB transfer at a time.  Check and claim
+     * tx_active under PRIMASK so an ISR preemption between the
+     * check and the set is impossible — this is the root-fix for
+     * the EPENA race that caused 8-14 s endpoint stalls.
+     */
+    uint32_t primask;
+    __asm volatile("mrs %0, primask" : "=r"(primask));
+    __asm volatile("cpsid i" ::: "memory");
+    if (serial->tx_active) {
+        /* Another transfer is in-flight; the completion ISR (or
+         * the drain loop) will call kick_tx again when it finishes. */
+        __asm volatile("msr primask, %0" :: "r"(primask) : "memory");
+        return;
+    }
+    serial->tx_active = 1;
+    __asm volatile("msr primask, %0" :: "r"(primask) : "memory");
+
     uint16_t mps = usbd_get_ep_mps(serial->busid, serial->in_ep);
     if (!mps) mps = 64;
 
@@ -256,7 +266,6 @@ static void usbd_serial_kick_tx(struct usbd_serial *serial)
         return;
     }
 
-    serial->tx_active = 1;
     dbg_serial_tx_kick++;
     int ret = usbd_ep_start_write(serial->busid, serial->in_ep, serial->tx_pkt, got);
     if (ret < 0) {
@@ -350,6 +359,15 @@ void usbd_cdc_acm_bulk_in(uint8_t busid, uint8_t ep, uint32_t nbytes)
              * (PKTCNT=1/XFRSIZ=0 stuck) and is unnecessary here.
              * ChibiOS CDC likewise never sends ZLP for stream data.
              */
+            /* Clear tx_active and re-arm the next transfer.
+             * After XFRC the hardware cleared EPENA, so kick_tx's
+             * usbd_ep_start_write will NOT enter the EPENA flush
+             * path (the deadly 200K nop dwc2_flush_txfifo).
+             * kick_tx now keeps PRIMASK=1 through the entire
+             * usbd_ep_start_write call, so even in ISR context
+             * (where PRIMASK is already 1) the race window between
+             * tx_active check and EPENA set is closed. */
+            serial->tx_active = 0;
             usbd_serial_kick_tx(serial);
             return;
         }
