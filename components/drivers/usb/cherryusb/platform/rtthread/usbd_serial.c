@@ -64,6 +64,7 @@ static void usbd_serial_kick_tx(struct usbd_serial *serial);
 volatile uint32_t dbg_serial_rx_rearm = 0;
 volatile uint32_t dbg_serial_rx_rearm_skip = 0;
 volatile uint32_t dbg_serial_bulkout_cnt = 0;
+volatile int32_t  dbg_serial_bulkout_rearm_ret = 0;
 
 void usbd_serial_reset_tx(void)
 {
@@ -378,7 +379,7 @@ void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
         serial = &g_usbd_serial_cdc_acm[devno];
         if (serial->out_ep == ep) {
             rt_ringbuffer_put(&serial->rx_rb, g_usbd_serial_cdc_acm_rx_buf[serial->minor], nbytes);
-            usbd_ep_start_read(serial->busid, serial->out_ep,
+            dbg_serial_bulkout_rearm_ret = usbd_ep_start_read(serial->busid, serial->out_ep,
                 g_usbd_serial_cdc_acm_rx_buf[serial->minor],
                 usbd_get_ep_mps(serial->busid, serial->out_ep));
 
