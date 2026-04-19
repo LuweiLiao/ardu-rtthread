@@ -65,6 +65,9 @@ volatile uint32_t dbg_serial_rx_rearm = 0;
 volatile uint32_t dbg_serial_rx_rearm_skip = 0;
 volatile uint32_t dbg_serial_bulkout_cnt = 0;
 volatile int32_t  dbg_serial_bulkout_rearm_ret = 0;
+volatile uint32_t dbg_serial_read_calls   = 0;  // times usbd_serial_read called
+volatile uint32_t dbg_serial_read_bytes  = 0;  // total bytes returned by usbd_serial_read
+volatile uint32_t dbg_serial_rb_put_bytes = 0;  // total bytes written to rx_rb by bulk_out
 
 void usbd_serial_reset_tx(void)
 {
@@ -167,12 +170,15 @@ static rt_ssize_t usbd_serial_read(struct rt_device *dev,
     RT_ASSERT(dev != RT_NULL);
 
     serial = (struct usbd_serial *)dev;
+    dbg_serial_read_calls++;
 
     if (!usb_device_is_configured(serial->busid)) {
         return -RT_EPERM;
     }
 
-    return rt_ringbuffer_get(&serial->rx_rb, (rt_uint8_t *)buffer, size);
+    rt_ssize_t _n = rt_ringbuffer_get(&serial->rx_rb, (rt_uint8_t *)buffer, size);
+    dbg_serial_read_bytes += _n;
+    return _n;
 }
 
 static volatile uint32_t dbg_serial_unstick_cnt = 0;
@@ -379,6 +385,7 @@ void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
         serial = &g_usbd_serial_cdc_acm[devno];
         if (serial->out_ep == ep) {
             rt_ringbuffer_put(&serial->rx_rb, g_usbd_serial_cdc_acm_rx_buf[serial->minor], nbytes);
+            dbg_serial_rb_put_bytes += nbytes;
             dbg_serial_bulkout_rearm_ret = usbd_ep_start_read(serial->busid, serial->out_ep,
                 g_usbd_serial_cdc_acm_rx_buf[serial->minor],
                 usbd_get_ep_mps(serial->busid, serial->out_ep));
