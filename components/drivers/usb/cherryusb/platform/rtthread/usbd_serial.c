@@ -21,7 +21,7 @@
 #endif
 
 #ifndef CONFIG_USBDEV_SERIAL_TX_BUFSIZE
-#define CONFIG_USBDEV_SERIAL_TX_BUFSIZE (4096)
+#define CONFIG_USBDEV_SERIAL_TX_BUFSIZE (32768)
 #endif
 
 struct usbd_serial {
@@ -175,6 +175,8 @@ static rt_ssize_t usbd_serial_read(struct rt_device *dev,
 }
 
 static volatile uint32_t dbg_serial_unstick_cnt = 0;
+volatile uint32_t dbg_serial_timeout_tx_active = 0;
+volatile uint32_t dbg_serial_timeout_ep_idle = 0;
 
 static rt_ssize_t usbd_serial_write(struct rt_device *dev,
                                     rt_off_t pos,
@@ -218,11 +220,25 @@ static rt_ssize_t usbd_serial_write(struct rt_device *dev,
         usbd_serial_kick_tx(serial);
     } else {
         dbg_serial_write_timeout++;
-        if (serial->tx_active && ++tx_stuck_counter > 100) {
-            usbd_ep_recover_stuck(serial->busid, serial->in_ep);
-            serial->tx_active = 0;
-            tx_stuck_counter = 0;
-            dbg_serial_unstick_cnt++;
+        /* Immediate self-heal: if tx_active is 1 but EP is idle,
+         * the ISR was missed.  Clear tx_active, reset the stuck
+         * counter, and attempt to drain the ringbuffer. */
+        if (serial->tx_active) {
+            dbg_serial_timeout_tx_active++;
+            uint8_t ep_idx = serial->in_ep & 0x7F;
+            uint32_t diepctl = DWC2_INEP(ep_idx)->DIEPCTL;
+            if (ep_idx && !(diepctl & USB_OTG_DIEPCTL_EPENA)) {
+                dbg_serial_timeout_ep_idle++;
+                serial->tx_active = 0;
+                tx_stuck_counter = 0;
+                dbg_serial_unstick_cnt++;
+                usbd_serial_kick_tx(serial);
+            } else if (++tx_stuck_counter > 100) {
+                usbd_ep_recover_stuck(serial->busid, serial->in_ep);
+                serial->tx_active = 0;
+                tx_stuck_counter = 0;
+                dbg_serial_unstick_cnt++;
+            }
         }
     }
 
@@ -235,6 +251,14 @@ static void usbd_serial_kick_tx(struct usbd_serial *serial)
         serial->tx_active = 0;
         rt_ringbuffer_reset(&serial->tx_rb);
         return;
+    }
+
+    /* Self-heal: if tx_active is set but hardware EP is idle, clear it */
+    if (serial->tx_active) {
+        uint8_t ep_idx = serial->in_ep & 0x7F;
+        if (ep_idx && !(DWC2_INEP(ep_idx)->DIEPCTL & USB_OTG_DIEPCTL_EPENA)) {
+            serial->tx_active = 0;
+        }
     }
 
     /*
