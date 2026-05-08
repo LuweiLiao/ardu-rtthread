@@ -375,6 +375,8 @@ rt_err_t usbd_serial_register(struct usbd_serial *serial,
     return ret;
 }
 
+extern void uart_usb_rx_bridge(const uint8_t *data, uint32_t len);
+
 void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
 {
     struct usbd_serial *serial;
@@ -384,7 +386,7 @@ void usbd_cdc_acm_bulk_out(uint8_t busid, uint8_t ep, uint32_t nbytes)
     for (uint8_t devno = 0; devno < CONFIG_USBDEV_MAX_CDC_ACM_CLASS; devno++) {
         serial = &g_usbd_serial_cdc_acm[devno];
         if (serial->out_ep == ep) {
-            rt_ringbuffer_put(&serial->rx_rb, g_usbd_serial_cdc_acm_rx_buf[serial->minor], nbytes);
+            uart_usb_rx_bridge(g_usbd_serial_cdc_acm_rx_buf[serial->minor], nbytes);
             dbg_serial_rb_put_bytes += nbytes;
             dbg_serial_bulkout_rearm_ret = usbd_ep_start_read(serial->busid, serial->out_ep,
                 g_usbd_serial_cdc_acm_rx_buf[serial->minor],
