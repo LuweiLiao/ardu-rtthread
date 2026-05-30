@@ -25,6 +25,10 @@
 #include "drv_config.h"
 #include <string.h>
 
+#ifndef RTT_SECTION_SRAM1_BSS
+#define RTT_SECTION_SRAM1_BSS
+#endif
+
 /*#define DRV_DEBUG*/
 #define LOG_TAG              "drv.spi"
 #include <drv_log.h>
@@ -84,7 +88,7 @@ static struct stm32_spi_config spi_config[] =
 #endif
 };
 
-static struct stm32_spi spi_bus_obj[sizeof(spi_config) / sizeof(spi_config[0])] = {0};
+static struct stm32_spi spi_bus_obj[sizeof(spi_config) / sizeof(spi_config[0])] RTT_SECTION_SRAM1_BSS = {0};
 
 static rt_err_t stm32_spi_init(struct stm32_spi *spi_drv, struct rt_spi_configuration *cfg)
 {
