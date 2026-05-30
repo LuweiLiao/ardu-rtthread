@@ -258,10 +258,15 @@ static rt_err_t stm32_spi_init(struct stm32_spi *spi_drv, struct rt_spi_configur
 
         __HAL_LINKDMA(&spi_drv->handle, hdmarx, spi_drv->dma.handle_rx);
 
-        /* NVIC configuration for DMA transfer complete interrupt
-         * Priority 5: below RT-Thread kernel critical section threshold,
-         * same group as TX to prevent DMA RX/TX nesting each other */
-        HAL_NVIC_SetPriority(spi_drv->config->dma_rx->dma_irq, 5, 0);
+        /* NVIC configuration for DMA transfer complete interrupt */
+#if defined(SOC_SERIES_STM32F7)
+        const uint32_t spi_dma_preempt =
+            ((spi_drv->config->Instance == SPI1) || (spi_drv->config->Instance == SPI4))
+            ? 6U : 5U;
+#else
+        const uint32_t spi_dma_preempt = 5U;
+#endif
+        HAL_NVIC_SetPriority(spi_drv->config->dma_rx->dma_irq, spi_dma_preempt, 0);
         HAL_NVIC_EnableIRQ(spi_drv->config->dma_rx->dma_irq);
     }
 
@@ -271,9 +276,14 @@ static rt_err_t stm32_spi_init(struct stm32_spi *spi_drv, struct rt_spi_configur
 
         __HAL_LINKDMA(&spi_drv->handle, hdmatx, spi_drv->dma.handle_tx);
 
-        /* NVIC configuration for DMA transfer complete interrupt
-         * Priority 5: same group as RX to prevent nesting */
-        HAL_NVIC_SetPriority(spi_drv->config->dma_tx->dma_irq, 5, 1);
+#if defined(SOC_SERIES_STM32F7)
+        const uint32_t spi_dma_tx_preempt =
+            ((spi_drv->config->Instance == SPI1) || (spi_drv->config->Instance == SPI4))
+            ? 6U : 5U;
+#else
+        const uint32_t spi_dma_tx_preempt = 5U;
+#endif
+        HAL_NVIC_SetPriority(spi_drv->config->dma_tx->dma_irq, spi_dma_tx_preempt, 1);
         HAL_NVIC_EnableIRQ(spi_drv->config->dma_tx->dma_irq);
     }
 
