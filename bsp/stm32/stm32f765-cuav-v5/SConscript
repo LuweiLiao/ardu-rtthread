@@ -10,13 +10,22 @@ cwd = GetCurrentDir()
 objs = []
 dirlist = os.listdir(cwd)
 
-# Package include paths so kernel/board can find stm32f7xx.h, core_cm7.h
+# Package include paths so kernel/board can find stm32f7xx.h, core_cm7.h, board.h
 env.Append(CPPPATH = [
     os.path.join(cwd, 'packages', 'CMSIS-Core-latest', 'Include'),
     os.path.join(cwd, 'packages', 'stm32f7_cmsis_driver-latest', 'Include'),
     os.path.join(cwd, 'packages', 'stm32f7_hal_driver-latest', 'Inc'),
+    # Board path for HAL_Drivers/drivers/drv_gpio.c → <board.h>
+    os.path.join(cwd, 'board'),
+    os.path.join(cwd, 'board', 'drivers_ll'),
+    os.path.join(cwd, 'board', 'CubeMX_Config', 'Inc'),
 ])
-env.Append(CPPDEFINES = ['STM32F767xx', 'USE_HAL_DRIVER', 'USE_FULL_LL_DRIVER'])
+# CMSIS-DSP include path (libraries/AP_GyroFFT/CMSIS_5/include)
+_cmsis_dsp_include = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(cwd)))),
+    'libraries', 'AP_GyroFFT', 'CMSIS_5', 'include')
+if os.path.isdir(_cmsis_dsp_include):
+    env.Append(CPPPATH=[_cmsis_dsp_include])
+env.Append(CPPDEFINES = ['STM32F767xx', 'USE_HAL_DRIVER', 'USE_FULL_LL_DRIVER', 'ARM_MATH_CM7'])
 
 # Ensure hwdef.h is available at build/rtt_cuav_v5/ for both BSP code and ap_config.h
 _ap_root = os.environ.get('AP_ROOT', os.path.abspath(os.path.join(cwd, '..', '..', '..', '..', '..')))
@@ -27,18 +36,38 @@ _dst_hwdef = os.path.join(_hwdef_dir, 'hwdef.h')
 if os.path.isfile(_bsp_hwdef):
     import shutil as _sh
     _sh.copy2(_bsp_hwdef, _dst_hwdef)
-_bsp_romfs_h = os.path.join(cwd, 'ap_romfs_embedded.h')
-_dst_romfs_h = os.path.join(_hwdef_dir, 'ap_romfs_embedded.h')
-if os.path.isfile(_bsp_romfs_h):
-    import shutil as _sh2
-    _sh2.copy2(_bsp_romfs_h, _dst_romfs_h)
+_bsp_rtconfig = os.path.join(cwd, 'rtconfig.h')
+_dst_rtconfig = os.path.join(_hwdef_dir, 'rtconfig.h')
+if os.path.isfile(_bsp_rtconfig):
+    _sh.copy2(_bsp_rtconfig, _dst_rtconfig)
 env.Append(CPPPATH = [_hwdef_dir])
+
+# USB backend mutex: native | tinyusb | cherryusb (one OTG_FS_IRQHandler provider)
+_scripts_dir = os.path.join(_ap_root, 'Tools', 'scripts')
+if _scripts_dir not in sys.path:
+    sys.path.insert(0, _scripts_dir)
+import rtt_usb_backend as _rtt_usb_backend
+_USB = _rtt_usb_backend.resolve_usb_backend()
+env.Append(CPPDEFINES=_USB['cpp_defines'])
+_rtt_usb_backend.apply_bsp_usb_build_options(env, _USB, BuildOptions)
+if _USB['l8_msc_no_sdio']:
+    BuildOptions['BSP_USING_SDIO'] = 0
+    BuildOptions['RT_USING_SDIO'] = 0
+    env.Append(CCFLAGS=' -U BSP_USING_SDIO -U RT_USING_SDIO')
+if os.environ.get('RTT_DISABLE_SDIO', '').strip() in ('1', 'true', 'yes', 'on'):
+    BuildOptions['BSP_USING_SDIO'] = 0
+    BuildOptions['RT_USING_SDIO'] = 0
+    env.Append(CCFLAGS=' -U BSP_USING_SDIO -U RT_USING_SDIO')
+if _USB['ardupilot_full']:
+    os.environ['RTT_USB_BACKEND'] = _USB['backend']
+print('RTT USB backend: %s (TEST_NAME=%r ARDUPILOT_FULL=%s)' % (
+    _USB['backend'], _USB['test_name'] or None, _USB['ardupilot_full']))
 
 # Module test build: TEST_NAME=<name> => skip ArduPilot and applications, build test firmware
 TEST_NAME = os.environ.get('TEST_NAME', '')
 
 if TEST_NAME:
-    env.Append(CPPDEFINES = ['FLASH_ORIGIN=0x08000000U'])
+    env.Append(CPPDEFINES = ['FLASH_ORIGIN=0x08008000U'])
     old_lflags = env.get('LINKFLAGS', '')
     if isinstance(old_lflags, list):
         old_lflags = ' '.join(str(v) for v in old_lflags)
@@ -51,22 +80,61 @@ if ARDUPILOT_FULL:
     AP_ROOT = os.environ.get('AP_ROOT', '')
     if not AP_ROOT or not os.path.isfile(os.path.join(AP_ROOT, 'Tools', 'scripts', 'scons_ardupilot_sources.py')):
         AP_ROOT = os.path.abspath(os.path.join(cwd, '..', '..', '..', '..', '..'))
+    _scripts_dir = os.path.join(AP_ROOT, 'Tools', 'scripts')
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+    import rtt_ar_archive as _rtt_ar_archive
+    _rtt_ar_archive.configure_tempfile_ar(
+        env,
+        max_line_length=8192,
+        tempfile_dir=os.path.join(AP_ROOT, 'build', 'rtt_cuav_v5'),
+    )
     env.Append(LINKFLAGS=' -Wl,--start-group -lstdc++ -lsupc++ -lgcc -Wl,--end-group')
     env.Append(LIBS=['stdc++', 'supc++', 'gcc'])
     env.Append(LINKFLAGS=' -Wl,--allow-multiple-definition')
+    # CMSIS-DSP prebuilt library (ChibiOS reference: Tools/ardupilotwaf/chibios.py:744-754)
+    _cmsis_dsp_lib_src = os.path.join(AP_ROOT, 'libraries', 'AP_GyroFFT', 'CMSIS_5', 'lib', 'libarm_cortexM7lfdp_math.a')
+    if os.path.isfile(_cmsis_dsp_lib_src):
+        _cmsis_dsp_lib_dst = os.path.join(AP_ROOT, 'build', 'rtt_cuav_v5', 'libDSP.a')
+        import shutil
+        shutil.copy2(_cmsis_dsp_lib_src, _cmsis_dsp_lib_dst)
+        env.Append(LIBS=['DSP'])
+        env.Append(LIBPATH=[os.path.join(AP_ROOT, 'build', 'rtt_cuav_v5')])
+    # stdio linker wrapping (ChibiOS reference: Tools/ardupilotwaf/chibios.py:758-774)
+    _wraplist = ['sscanf', 'fprintf', 'snprintf', 'vsnprintf',
+                 'vasprintf', 'asprintf', 'vprintf', 'scanf', 'printf']
+    for w in _wraplist:
+        env.Append(LINKFLAGS=' -Wl,--wrap,%s' % w)
     config_py = os.path.join(cwd, 'scons_ardupilot_config.py')
     script = os.path.join(AP_ROOT, 'Tools', 'scripts', 'scons_ardupilot_sources.py')
     if os.path.isfile(script):
-        subprocess.check_call([sys.executable, script, AP_ROOT, '--board', 'rtt_cuav_v5', '--bsp-dir', cwd, '--output', cwd])
+        _gen_env = os.environ.copy()
+        _gen_env['RTT_USB_BACKEND'] = _USB['backend']
+        subprocess.check_call(
+            [sys.executable, script, AP_ROOT, '--board', 'rtt_cuav_v5', '--bsp-dir', cwd, '--output', cwd],
+            env=_gen_env)
     if os.path.isfile(config_py):
         with open(config_py) as f:
             exec(f.read())
         env.Append(CPPPATH=ap_cpppath)
         ap_config_h = os.path.join(AP_ROOT, 'build', 'rtt_cuav_v5', 'ap_config.h')
+        _ap_config_template = (
+            '#ifndef _AP_CONFIG_H_\n'
+            '#define _AP_CONFIG_H_\n'
+            '\n'
+            '#include "hwdef.h"\n'
+            '\n'
+            '#ifdef HAL_NUM_CAN_IFACES\n'
+            '#  undef HAL_NUM_CAN_IFACES\n'
+            '#endif\n'
+            '#define HAL_NUM_CAN_IFACES 0\n'
+            '\n'
+            '#endif\n'
+        )
         if not os.path.isfile(ap_config_h):
             os.makedirs(os.path.dirname(ap_config_h), exist_ok=True)
             with open(ap_config_h, 'w') as _f:
-                _f.write('#ifndef _AP_CONFIG_H_\n#define _AP_CONFIG_H_\n\n#include "hwdef.h"\n\n#endif\n')
+                _f.write(_ap_config_template)
         else:
             with open(ap_config_h) as _f:
                 _cfg = _f.read()
@@ -90,9 +158,21 @@ for d in dirlist:
         objs = objs + SConscript(os.path.join(path, 'SConscript'))
 
 if TEST_NAME:
-    test_dir = os.path.join(cwd, 'tests', 'test_' + TEST_NAME)
-    test_sconscript = os.path.join(test_dir, 'SConscript')
+    _scripts_dir = os.path.join(_ap_root, 'Tools', 'scripts')
+    if _scripts_dir not in sys.path:
+        sys.path.insert(0, _scripts_dir)
+    import rtt_test_manifest as _rtt_test_manifest
+    _test_dir, _test_common_dir, _test_key = _rtt_test_manifest.resolve_test_paths(
+        _ap_root, TEST_NAME, cwd)
+    test_app_desc = os.path.join(_test_common_dir, 'test_app_descriptor.c')
+    if os.path.isfile(test_app_desc):
+        objs = objs + DefineGroup('test_app_descriptor',
+                                  [test_app_desc],
+                                  depend=[''],
+                                  CPPPATH=[_test_common_dir, _hwdef_dir])
+    test_sconscript = os.path.join(_test_dir, 'SConscript')
     if os.path.isfile(test_sconscript):
+        print('RTT module test: %s -> %s' % (_test_key, _test_dir))
         objs = objs + SConscript(test_sconscript)
     else:
         print('ERROR: Test not found: %s (expected %s)' % (TEST_NAME, test_sconscript))

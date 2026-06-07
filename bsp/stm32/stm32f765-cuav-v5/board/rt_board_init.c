@@ -8,6 +8,8 @@
  * Flash origin:    FLASH_ORIGIN
  */
 #include <rtthread.h>
+#include <rtdevice.h>
+#include <stdbool.h>
 #include "board.h"
 #include "drv_gpio.h"
 
@@ -22,6 +24,9 @@
 #include "drv_spi_lld.h"
 #endif
 
+extern void usb_lld_poll_rtt(void);
+extern bool usb_lld_is_configured_rtt(void);
+
 extern int rt_hw_pin_init(void);
 extern int rt_hw_usart_init(void);
 extern void __libc_init_array(void);
@@ -35,13 +40,23 @@ struct spi_attach_entry {
 };
 
 static const struct spi_attach_entry _spi_attach_table[] = {
-    HAL_RTT_SPI_ATTACH_LIST
+#define HAL_RTT_SPI_ATTACH_ROW(busnum, busname, devname, cs) \
+    {busname, devname, cs}
+    HAL_RTT_SPI_ATTACH_FOREACH(HAL_RTT_SPI_ATTACH_ROW)
+#undef HAL_RTT_SPI_ATTACH_ROW
 };
 
 static void _spi_device_init(void)
 {
     rt_kprintf("[SPI-INIT] Starting SPI device attachment\n");
     for (unsigned i = 0; i < sizeof(_spi_attach_table) / sizeof(_spi_attach_table[0]); i++) {
+        if (rt_device_find(_spi_attach_table[i].bus_name) == RT_NULL) {
+            rt_kprintf("[SPI-ATTACH] skip %s -> %s: bus %s not found\n",
+                       _spi_attach_table[i].bus_name,
+                       _spi_attach_table[i].dev_name,
+                       _spi_attach_table[i].bus_name);
+            continue;
+        }
         rt_err_t ret = rt_hw_spi_device_attach(_spi_attach_table[i].bus_name,
                                 _spi_attach_table[i].dev_name,
                                 _spi_attach_table[i].cs_pin);
@@ -86,24 +101,26 @@ static void _mpu_config(void)
 
     /*
      * Region 1: Peripheral space (0x40000000, 512MB)
-     * Device, non-cacheable, Shareable, Full Access, XN
+     * Device Shareable - matches ARMv7-M default memory map.
+     * TEX=010, C=0, B=1, S=1 -> Device Shareable (ARM ARM B3-572).
+     * ChibiOS uses PRIVDEFENA default map instead of explicit region.
      */
     MPU->RNR  = 1;
     MPU->RBAR = 0x40000000U;
     MPU->RASR = (1U  << 28) |  /* XN=1 no exec */
                 (3U  << 24) |  /* AP=011 full access */
-                (0U  << 19) |  /* TEX=000 */
+                (2U  << 19) |  /* TEX=010 = Device */
                 (1U  << 18) |  /* S=1 shareable */
-                (0U  << 17) |  /* C=0 not cacheable */
-                (1U  << 16) |  /* B=1 bufferable */
+                (0U  << 17) |  /* C=0 */
+                (1U  << 16) |  /* B=1 (required for Device Shareable) */
                 (0U  <<  8) |  /* SRD=0 */
                 (28U <<  1) |  /* SIZE=28 → 512MB */
                 (1U  <<  0);   /* ENABLE */
 
     /*
-     * Region 2: SDIO DMA buffer (cache_buf in .sram1_bss) — non-cacheable.
-     * 16KB at 0x20020000, but only sub-regions 3-5 enabled (0x20021800–0x20022FFF)
-     * via SRD mask. Higher region number overrides Region 0 for this range.
+     * Region 2: .sram1_bss DMA buffers (e.g. SDIO cache_buf) — non-cacheable.
+     * Linker places .sram1_bss at 0x20020000; cover full 64KB SRAM1 tail.
+     * Higher region number overrides Region 0 for this range.
      */
     MPU->RNR  = 2;
     MPU->RBAR = 0x20020000U;
@@ -113,8 +130,8 @@ static void _mpu_config(void)
                 (0U  << 18) |  /* S=0 */
                 (0U  << 17) |  /* C=0 */
                 (0U  << 16) |  /* B=0 */
-                (0xC7U << 8) | /* SRD=11000111: disable sub 0,1,2,6,7; enable 3,4,5 */
-                (13U <<  1) |  /* SIZE=13 → 16KB */
+                (0U  <<  8) |  /* SRD=0: all sub-regions enabled */
+                (15U <<  1) |  /* SIZE=15 → 64KB */
                 (1U  <<  0);   /* ENABLE */
 
     MPU->CTRL = MPU_CTRL_PRIVDEFENA_Msk | MPU_CTRL_ENABLE_Msk;
@@ -196,8 +213,50 @@ static void _spi_lld_board_init(void)
 }
 #endif /* SOC_SERIES_STM32F7 */
 
+/* ──────────────────────────────────────────────
+ *  IWDG early feed — Layer 0 foundation.
+ *  Hardware watchdog (if enabled by option bytes)
+ *  starts counting from reset with ~512ms timeout.
+ *
+ *  Strategy: feed NOW, don't reconfigure PR/RLR
+ *  (LSI-domain PVU/RVU sync can hang early in boot
+ *   before clock init).  The 512ms window is enough
+ *   for board init + scheduler startup; after that,
+ *   ap_rtt_iwdg_init() in HAL_RTT::run() extends
+ *   to ~10s and sets up periodic feeding.
+ *
+ *  CMSIS struct access — uses IWDG_TypeDef from
+ *  stm32f7xx.h (no HAL dependency).
+ * ────────────────────────────────────────────── */
+static void _iwdg_early_feed(void)
+{
+    /* Just reload the counter; no PR/RLR writes.
+     * 0xAAAA is the refresh key — doesn't need unlock. */
+    IWDG->KR = 0xAAAAU;
+}
+
+static void _iwdg_reconfig(void)
+{
+    /* Reconfigure IWDG to longer timeout (~10s).
+     * Called AFTER clock init, when LSI is stable
+     * and APB bus interface is fully operational.
+     * NO rt_kprintf here — console not yet initialized. */
+    IWDG->KR = 0x5555U;
+    IWDG->PR = 6U;
+    for (volatile int i = 0; i < 100000 && (IWDG->SR & IWDG_SR_PVU); i++) { }
+    IWDG->KR = 0x5555U;
+    IWDG->RLR = 1250U;
+    for (volatile int i = 0; i < 100000 && (IWDG->SR & IWDG_SR_RVU); i++) { }
+    IWDG->KR = 0xAAAAU;
+}
+
 void rt_hw_board_init(void)
 {
+    /* Layer 0: IWDG watchdog — feed immediately before any init that
+     * may take >512ms (the default hardware watchdog timeout).
+     * PR/RLR reconfig deferred to after clock init (see _iwdg_reconfig below). */
+    _iwdg_early_feed();
+
     rt_kprintf("[BOARD-INIT] Starting board initialization\n");
 #ifdef FLASH_ORIGIN
     SCB->VTOR = FLASH_ORIGIN;
@@ -210,14 +269,37 @@ void rt_hw_board_init(void)
     SCB_EnableICache();
     // SCB_EnableDCache();  // Disabled: USB DWC2 DMA coherency issues on STM32F7
 
-    /* Minimal HAL_Init() equivalent — direct register operations */
-    FLASH->ACR |= FLASH_ACR_ARTEN | FLASH_ACR_PRFTEN;
-    NVIC_SetPriorityGrouping(3U);  /* PRIGROUP=3 → 4-bit preemption (same as HAL NVIC_PRIORITYGROUP_4) */
+    /* Enable SWD debug interface in all low-power modes (WFI/STOP/STANDBY).
+     * Without this, ST-Link connection drops when the chip enters WFI idle.
+     * CUAV V5 NRST pin is not connected, so SWD must stay alive. */
+    DBGMCU->CR |= DBGMCU_CR_DBG_SLEEP | DBGMCU_CR_DBG_STOP | DBGMCU_CR_DBG_STANDBY;
 
-    SystemClock_Config();
+    /* Freeze IWDG counter when debugger halts the CPU.
+     * Without this, IWDG continues running during debug → ~2s timeout → reset →
+     * debug connection drops. */
+    DBGMCU->APB1FZ |= DBGMCU_APB1_FZ_DBG_IWDG_STOP;
+
+    /* Clock init: pure CMSIS register writes (no HAL) */
+    NVIC_SetPriorityGrouping(3U);  /* PRIGROUP=3 → 4-bit preemption */
+
+    rtt_clock_init();
+    rtt_enable_peripheral_clocks();
+
+    /* IWDG reconfig to ~10s — after clock/peripheral init so APB bus
+     * interface is stable and LSI-domain sync completes reliably. */
+    _iwdg_reconfig();
+
     rt_hw_systick_init();
     rt_hw_pin_init();
     rt_hw_usart_init();
+
+#ifdef SOC_SERIES_STM32F7
+    /* UART7 hardware telemetry lane for closed-loop agents (independent of console). */
+    extern void rtt_ctl_uart_hw_init(void);
+    extern void rtt_ctl_hw_write(const char *s);
+    rtt_ctl_uart_hw_init();
+    rtt_ctl_hw_write("[BOARD-INIT] uart7 hw lane up\r\n");
+#endif
 
     /* GPIO power pins moved to _sensor_power_init (INIT_PREV_EXPORT) —
      * DCache interference causes MODER writes at this early stage to be
@@ -246,22 +328,74 @@ void rt_hw_board_init(void)
     rt_components_board_init();
 #endif
 
-    /* Workaround: SPI1 MOSI (PD7) MODER gets reset to INPUT by a subsequent
-     * HAL_GPIO_Init on the same GPIO port (GPIOD). The STM32F7 HAL performs
-     * read-modify-write on MODER/AFR and the write may be lost if another
-     * caller touches the same register concurrently or in a later init step.
-     * Force PD7 back to AF mode here, after all board init is done. */
+        /* 强制重新使能GPIOE时钟 — AHB1ENR |= GPIOEEN 在 stm32f7_clock_ll.c 中可能因
+         * D-Cache/同步问题未生效。加上DSB屏障保证写管道清空。 */
+        RCC->AHB1ENR |= RCC_AHB1ENR_GPIOEEN;
+        __DSB();
+        __ISB();
+        (void)RCC->AHB1ENR;  /* 强制读，保证写管道清空 */
+
+        /* Sensor power PE3 re-apply (SPI4 HAL init can clobber it) */
+    {
+        volatile uint32_t *moder = (volatile uint32_t *)0x40021000; /* GPIOE */
+        uint32_t m = *moder;
+        m &= ~(3U << 6);   /* clear PE3 MODER bits */
+        m |= (1U << 6);    /* set OUTPUT mode */
+        *moder = m;
+        /* Also ensure ODR[3] = HIGH */
+        *(volatile uint32_t *)0x40021014 |= (1U << 3);
+    }
+
+    /*
+     * SPI1 GPIO early init — configure PG11(SCK)/PA6(MISO)/PD7(MOSI) as AF5.
+     * Must happen here (before SPI/IMU probe in setup()) rather than lazily
+     * in SPIDevice.cpp _spi1_gpio_init(), because the lazy init is only
+     * triggered on first SPI transfer — setup() probes the IMU before that.
+     *
+     * Pinout (CUAV V5, confirmed from ChibiOS fmuv5):
+     *   PG11=SCK(AF5), PA6=MISO(AF5), PD7=MOSI(AF5)
+     *   NOT PA5/PA7 (those are FMU_CAP1 and HEATER_EN respectively!)
+     */
 #ifdef BSP_USING_SPI1
     {
-        volatile uint32_t *moder = (volatile uint32_t *)0x40020C00; /* GPIOD */
-        uint32_t m = *moder;
-        m &= ~(3U << 14);  /* clear PD7 MODER bits */
-        m |= (2U << 14);   /* set AF mode */
-        *moder = m;
+        RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_GPIODEN | RCC_AHB1ENR_GPIOGEN;
+        (void)RCC->AHB1ENR;
+        /* PG11 SCK: MODE=AF(10), AF=AF5(0101) */
+        GPIOG->MODER = (GPIOG->MODER & ~(3U << 22)) | (2U << 22);
+        GPIOG->AFR[1] = (GPIOG->AFR[1] & ~(0xFU << 12)) | (5U << 12);
+        GPIOG->OSPEEDR = (GPIOG->OSPEEDR & ~(3U << 22)) | (3U << 22);
+        /* PA6 MISO: MODE=AF(10), AF=AF5(0101) */
+        GPIOA->MODER = (GPIOA->MODER & ~(3U << 12)) | (2U << 12);
+        GPIOA->AFR[0] = (GPIOA->AFR[0] & ~(0xFU << 24)) | (5U << 24);
+        GPIOA->OSPEEDR = (GPIOA->OSPEEDR & ~(3U << 12)) | (3U << 12);
+        /* PD7 MOSI: MODE=AF(10), AF=AF5(0101) */
+        GPIOD->MODER = (GPIOD->MODER & ~(3U << 14)) | (2U << 14);
+        GPIOD->AFR[0] = (GPIOD->AFR[0] & ~(0xFU << 28)) | (5U << 28);
+        GPIOD->OSPEEDR = (GPIOD->OSPEEDR & ~(3U << 14)) | (3U << 14);
+
+        /*
+         * SPI1 CS — drive all inactive (HIGH) before IMU/SPI probe.
+         * ChibiOS fmuv5 SPI1 CS: PF2(ICM20689), PF3(ICM20602), PF4(BMI055_G),
+         * PG10(BMI055_A).  Also PH5(AUXMEM_CS), PF11(SPARE/ICM42688 on RTT).
+         */
+        RCC->AHB1ENR |= RCC_AHB1ENR_GPIOFEN | RCC_AHB1ENR_GPIOHEN;
+        (void)RCC->AHB1ENR;
+        __DSB();
+        GPIOF->MODER = (GPIOF->MODER & ~((3U << 4) | (3U << 6) | (3U << 8) | (3U << 22)))
+                     | ((1U << 4) | (1U << 6) | (1U << 8) | (1U << 22));
+        GPIOF->BSRR = (1U << 2) | (1U << 3) | (1U << 4) | (1U << 11);
+        GPIOG->MODER = (GPIOG->MODER & ~(3U << 20)) | (1U << 20);
+        GPIOG->BSRR = (1U << 10);
+        GPIOH->MODER = (GPIOH->MODER & ~(3U << 10)) | (1U << 10);
+        GPIOH->BSRR = (1U << 5);
     }
 #endif
 
     rt_kprintf("[BOARD-INIT] Board initialization complete\n");
+
+    /* Feed IWDG at end of board_init — covers RT-Thread scheduler startup
+     * and transition into the main thread before ap_rtt_iwdg_init() takes over. */
+    IWDG->KR = 0xAAAAU;
 }
 
 #if defined(BSP_USING_SPI) && defined(HAL_RTT_SPI_ATTACH_LIST)
@@ -355,14 +489,25 @@ static void _sd_try_mount_once(void)
     }
 }
 
+extern void ap_rtt_iwdg_kick(void);
+
 static void _sd_mount_thread(void *arg)
 {
     (void)arg;
+    rtt_sd_mount_stage = 1;
+    rt_pin_mode(SD_POWER_PIN, PIN_MODE_OUTPUT);
+    rt_pin_write(SD_POWER_PIN, PIN_HIGH);
+    rt_thread_mdelay(300);
+    ap_rtt_iwdg_kick();
+
+    rtt_sd_mount_stage = 2;
     for (int round = 0; round < 120; round++) {
+        ap_rtt_iwdg_kick();
         if (rtt_sd_mount_result == 0) break;
         _sd_try_mount_once();
         if (rtt_sd_mount_result == 0) break;
         rt_thread_mdelay(500);
+        ap_rtt_iwdg_kick();
     }
     if (rtt_sd_mount_result != 0) {
         rtt_sd_mount_stage = -4;
@@ -372,28 +517,18 @@ static void _sd_mount_thread(void *arg)
 }
 
 /*
- * SD mount: quick try in INIT_ENV_EXPORT, then spawn background thread for
- * retries so main() (ArduPilot) is not blocked for 60s when no card present.
+ * SD mount: INIT_APP_EXPORT spawns background thread only — no sync power
+ * delay or mount retries in rt_components_init (ArduPilot main() unblocked).
  */
-static int sd_card_mount_sync(void)
+static int sd_card_mount_init(void)
 {
-    rtt_sd_mount_stage = 1;
-    rt_pin_mode(SD_POWER_PIN, PIN_MODE_OUTPUT);
-    rt_pin_write(SD_POWER_PIN, PIN_HIGH);
-    rt_thread_mdelay(300);
-
-    rtt_sd_mount_stage = 2;
-    _sd_try_mount_once();
-    if (rtt_sd_mount_result == 0) return 0;
-
-    /* Card not ready yet — spawn background retry thread */
     rt_thread_t th = rt_thread_create("sdmnt", _sd_mount_thread,
                                       RT_NULL, 2048,
                                       RT_THREAD_PRIORITY_MAX - 2, 20);
     if (th) rt_thread_startup(th);
     return 0;
 }
-INIT_ENV_EXPORT(sd_card_mount_sync);
+INIT_APP_EXPORT(sd_card_mount_init);
 #endif
 
 /* ----------------------------------------------------------------
@@ -409,6 +544,18 @@ static volatile uint32_t _measure_start_cyc = 0;
 
 static void _idle_hook(void)
 {
+    /* Feed IWDG every idle cycle — safety net when SysTick handler
+     * is temporarily starved (SPI burst with __disable_irq, etc.).
+     * Redundant with SysTick feed but zero-cost when idle. */
+    *(volatile uint32_t *)0x40003000UL = 0xAAAAU;
+
+    /* USB EP0 needs frequent service during enumeration; main/setup often
+     * busy-waits without calling usb_lld_poll_rtt(). Throttle idle polls. */
+    static uint8_t usb_idle_div;
+    if ((++usb_idle_div & 0x0F) == 0 && !usb_lld_is_configured_rtt()) {
+        usb_lld_poll_rtt();
+    }
+
     uint32_t now = DWT->CYCCNT;
     if (_idle_last_cyc != 0) {
         _idle_cycles_acc += (now - _idle_last_cyc);

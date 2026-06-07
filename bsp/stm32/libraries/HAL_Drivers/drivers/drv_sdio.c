@@ -27,6 +27,7 @@
 static struct stm32_sdio_config sdio_config = SDIO_BUS_CONFIG;
 static struct stm32_sdio_class sdio_obj;
 static struct rt_mmcsd_host *host;
+volatile rt_uint32_t rtt_dbg_sdio_irq_no_pkg;
 
 #define SDIO_TX_RX_COMPLETE_TIMEOUT_LOOPS    (100000)
 
@@ -546,6 +547,15 @@ void rthw_sdio_irq_process(struct rt_mmcsd_host *host)
     struct stm32_sdio *hw_sdio = sdio->sdio_des.hw_sdio;
     rt_uint32_t intstatus = hw_sdio->sta;
 
+    if (sdio->pkg == RT_NULL || sdio->pkg->cmd == RT_NULL)
+    {
+        rtt_dbg_sdio_irq_no_pkg++;
+        hw_sdio->icr = intstatus & (HW_SDIO_IT_CMDSENT | HW_SDIO_IT_CMDREND |
+                                    HW_SDIO_IT_DATAEND | HW_SDIO_ERRORS);
+        hw_sdio->mask = hw_sdio->mask & HW_SDIO_IT_SDIOIT ? HW_SDIO_IT_SDIOIT : 0x00;
+        return;
+    }
+
     if (intstatus & HW_SDIO_ERRORS)
     {
         hw_sdio->icr = HW_SDIO_ERRORS;
@@ -574,7 +584,8 @@ void rthw_sdio_irq_process(struct rt_mmcsd_host *host)
         {
             hw_sdio->icr = HW_SDIO_IT_CMDSENT;
 
-            if (resp_type(sdio->pkg->cmd) == RESP_NONE)
+            if (sdio->pkg != RT_NULL && sdio->pkg->cmd != RT_NULL &&
+                resp_type(sdio->pkg->cmd) == RESP_NONE)
             {
                 complete = 1;
             }
