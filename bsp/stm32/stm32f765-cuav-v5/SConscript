@@ -124,11 +124,6 @@ if ARDUPILOT_FULL:
             '\n'
             '#include "hwdef.h"\n'
             '\n'
-            '#ifdef HAL_NUM_CAN_IFACES\n'
-            '#  undef HAL_NUM_CAN_IFACES\n'
-            '#endif\n'
-            '#define HAL_NUM_CAN_IFACES 0\n'
-            '\n'
             '#endif\n'
         )
         if not os.path.isfile(ap_config_h):
