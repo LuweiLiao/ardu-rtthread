@@ -60,6 +60,14 @@ void rt_hw_systick_init(void)
  */
 void SysTick_Handler(void)
 {
+#if defined(SOC_SERIES_STM32F7)
+    /* [Cybernetics Ch.4] Closed-loop: this is the linked SysTick path on
+     * CUAV V5.  Hardware IWDG starts at reset and PR/RLR sync can remain
+     * pending, so reload from interrupt context before slow setup code can
+     * starve the watchdog. */
+    *((volatile uint32_t *)0x40003000UL) = 0xAAAAU;
+#endif
+
     /* enter interrupt */
     rt_interrupt_enter();
 

@@ -218,12 +218,10 @@ static void _spi_lld_board_init(void)
  *  Hardware watchdog (if enabled by option bytes)
  *  starts counting from reset with ~512ms timeout.
  *
- *  Strategy: feed NOW, don't reconfigure PR/RLR
- *  (LSI-domain PVU/RVU sync can hang early in boot
- *   before clock init).  The 512ms window is enough
- *   for board init + scheduler startup; after that,
- *   ap_rtt_iwdg_init() in HAL_RTT::run() extends
- *   to ~10s and sets up periodic feeding.
+ *  Strategy: feed NOW and never reconfigure PR/RLR.  CUAV V5 uses
+ *  hardware-IWDG option bytes, so PR/RLR writes do not take effect and can
+ *  leave PVU/RVU pending.  Keep the default ~512ms window and feed it from
+ *  the early startup, SysTick, and HAL scheduler paths.
  *
  *  CMSIS struct access — uses IWDG_TypeDef from
  *  stm32f7xx.h (no HAL dependency).
@@ -235,18 +233,8 @@ static void _iwdg_early_feed(void)
     IWDG->KR = 0xAAAAU;
 }
 
-static void _iwdg_reconfig(void)
+static void _iwdg_feed_only(void)
 {
-    /* Reconfigure IWDG to longer timeout (~10s).
-     * Called AFTER clock init, when LSI is stable
-     * and APB bus interface is fully operational.
-     * NO rt_kprintf here — console not yet initialized. */
-    IWDG->KR = 0x5555U;
-    IWDG->PR = 6U;
-    for (volatile int i = 0; i < 100000 && (IWDG->SR & IWDG_SR_PVU); i++) { }
-    IWDG->KR = 0x5555U;
-    IWDG->RLR = 1250U;
-    for (volatile int i = 0; i < 100000 && (IWDG->SR & IWDG_SR_RVU); i++) { }
     IWDG->KR = 0xAAAAU;
 }
 
@@ -254,7 +242,7 @@ void rt_hw_board_init(void)
 {
     /* Layer 0: IWDG watchdog — feed immediately before any init that
      * may take >512ms (the default hardware watchdog timeout).
-     * PR/RLR reconfig deferred to after clock init (see _iwdg_reconfig below). */
+     * PR/RLR are not software-configurable in hardware-IWDG mode. */
     _iwdg_early_feed();
 
     rt_kprintf("[BOARD-INIT] Starting board initialization\n");
@@ -285,9 +273,9 @@ void rt_hw_board_init(void)
     rtt_clock_init();
     rtt_enable_peripheral_clocks();
 
-    /* IWDG reconfig to ~10s — after clock/peripheral init so APB bus
-     * interface is stable and LSI-domain sync completes reliably. */
-    _iwdg_reconfig();
+    /* Hardware IWDG remains at its option-byte default; just refresh it after
+     * clock/peripheral setup before starting SysTick. */
+    _iwdg_feed_only();
 
     rt_hw_systick_init();
     rt_hw_pin_init();
