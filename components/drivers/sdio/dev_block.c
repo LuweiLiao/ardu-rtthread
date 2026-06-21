@@ -44,7 +44,7 @@ static struct rt_dm_ida sdio_ida = RT_DM_IDA_INIT(SDIO);
 static int __send_status(struct rt_mmcsd_card *card, rt_uint32_t *status, unsigned retries)
 {
     int err;
-    struct rt_mmcsd_cmd cmd;
+    struct rt_mmcsd_cmd cmd = { 0 };
 
     cmd.busy_timeout = 0;
     cmd.cmd_code = SEND_STATUS;
@@ -65,7 +65,7 @@ static int card_busy_detect(struct rt_mmcsd_card *card, unsigned int timeout_ms,
 {
     int timeout = rt_tick_from_millisecond(timeout_ms);
     int err = 0;
-    rt_uint32_t status;
+    rt_uint32_t status = 0;
     rt_tick_t start;
 
     start = rt_tick_get();
